@@ -141,7 +141,8 @@ class FileSearchScreen(ModalScreen):
     @work(thread=True)
     def _do_search(self, relative_path: str) -> None:
         try:
-            results = backend.find_file_in_snapshots(self.config, relative_path)
+            snapshots = backend.get_snapshots(self.config.name)  # cache hit
+            results = backend.find_file_in_snapshots(self.config, relative_path, snapshots)
         except backend.SudoExpiredError:
             self.app.call_from_thread(self._on_sudo_expired_search)
             return
@@ -381,7 +382,6 @@ class SnappyApp(App):
     def __init__(self) -> None:
         super().__init__()
         self.configs: list[backend.SnapperConfig] = []
-        self.snapshots: dict[str, list[backend.Snapshot]] = {}
         self.fs_usage: backend.FilesystemUsage | None = None
         self._loaded_configs: set[str] = set()  # configs whose snapshots have been fetched
 
@@ -444,7 +444,6 @@ class SnappyApp(App):
         fs_usage: backend.FilesystemUsage | None,
     ) -> None:
         self.configs = configs
-        self.snapshots = {}
         self._loaded_configs = set()
         self.fs_usage = fs_usage
 
@@ -514,7 +513,6 @@ class SnappyApp(App):
 
     def _populate_tab(self, config_name: str, snaps: list[backend.Snapshot]) -> None:
         self._loaded_configs.add(config_name)
-        self.snapshots[config_name] = snaps
 
         try:
             pane = self.query_one(f"#tab-{config_name}", TabPane)
@@ -587,9 +585,9 @@ class SnappyApp(App):
         cfg = self._get_active_config()
         if not cfg:
             return
-        # Mark all configs as unloaded and clear snapshot data
+        # Invalidate backend cache and clear app-level UI state
+        backend.invalidate_cache()
         self._loaded_configs = set()
-        self.snapshots = {}
         # Rebuild each tab's placeholder spinner (drop existing table/status)
         for c in self.configs:
             try:

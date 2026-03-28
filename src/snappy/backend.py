@@ -14,6 +14,30 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+# ── Caching ────────────────────────────────────────────────────────────
+#
+# Principle: any operation that is slow (i.e. involves a privileged
+# subprocess touching snapshot metadata) caches its result here.
+# Callers always go through the public get_* functions; the cache is
+# transparent to them.  Call invalidate_cache() after any mutating
+# operation (e.g. delete) so subsequent reads are fresh.
+
+_snapshot_cache: dict[str, list] = {}      # config_name -> list[Snapshot]
+_config_detail_cache: dict[str, dict] = {} # config_name -> dict[str, str]
+
+
+def invalidate_cache(config_name: str | None = None) -> None:
+    """Invalidate cached data for one config, or all configs if None."""
+    if config_name is None:
+        _snapshot_cache.clear()
+        _config_detail_cache.clear()
+        log.debug("Cache invalidated (all configs)")
+    else:
+        _snapshot_cache.pop(config_name, None)
+        _config_detail_cache.pop(config_name, None)
+        log.debug("Cache invalidated for config '%s'", config_name)
+
+
 # ── Sudo tracking ──────────────────────────────────────────────────────
 
 _sudo_last_confirmed: float = 0.0  # monotonic timestamp of last successful sudo check
@@ -190,6 +214,9 @@ def get_configs() -> list[SnapperConfig]:
 
 
 def get_snapshots(config_name: str) -> list[Snapshot]:
+    if config_name in _snapshot_cache:
+        log.debug("Cache hit: snapshots for '%s'", config_name)
+        return _snapshot_cache[config_name]
     result = _run_privileged(["snapper", "--jsonout", "-c", config_name, "list"])
     if result.returncode != 0:
         log.error("Failed to list snapshots for config '%s'", config_name)
@@ -219,7 +246,7 @@ def get_snapshots(config_name: str) -> list[Snapshot]:
         return []
 
     log.debug("snapper list raw entry count for '%s': %d", config_name, len(raw_list))
-    snapshots = []
+    snapshots: list[Snapshot] = []
     for s in raw_list:
         userdata = s.get("userdata", {})
         if isinstance(userdata, str):
@@ -237,19 +264,26 @@ def get_snapshots(config_name: str) -> list[Snapshot]:
             post_number=s.get("post-number") or None,
             read_only=s.get("read-only", True),
         ))
+    _snapshot_cache[config_name] = snapshots
+    log.debug("Cached %d snapshots for '%s'", len(snapshots), config_name)
     return snapshots
 
 
 def get_config_details(config_name: str) -> dict[str, str]:
+    if config_name in _config_detail_cache:
+        log.debug("Cache hit: config details for '%s'", config_name)
+        return _config_detail_cache[config_name]
     result = _run_privileged(["snapper", "--jsonout", "-c", config_name, "get-config"])
     if result.returncode != 0:
         log.error("Failed to get config details for '%s'", config_name)
         return {}
     try:
-        return json.loads(result.stdout)
+        details = json.loads(result.stdout)
     except json.JSONDecodeError:
         log.error("Invalid JSON from snapper get-config (config '%s'): %s", config_name, result.stdout[:200])
         return {}
+    _config_detail_cache[config_name] = details
+    return details
 
 
 def _parse_size(s: str) -> int:
@@ -348,9 +382,16 @@ def browse_directory(path: str | Path) -> list[FileInfo]:
     return entries
 
 
-def find_file_in_snapshots(config: SnapperConfig, relative_path: str) -> list[FileInSnapshot]:
-    """Find a file across all snapshots of a config."""
-    snapshots = get_snapshots(config.name)
+def find_file_in_snapshots(
+    config: SnapperConfig,
+    relative_path: str,
+    snapshots: list[Snapshot],
+) -> list[FileInSnapshot]:
+    """Find a file across all snapshots of a config.
+
+    Callers must supply the already-fetched snapshot list to avoid a redundant
+    slow sudo call.
+    """
     results = []
     for snap in snapshots:
         if snap.number == 0:
@@ -404,5 +445,6 @@ def find_file_in_snapshots(config: SnapperConfig, relative_path: str) -> list[Fi
 def delete_snapshot(config_name: str, snapshot_number: int) -> tuple[bool, str]:
     result = _run_privileged(["snapper", "-c", config_name, "delete", str(snapshot_number)], timeout=120)
     if result.returncode == 0:
+        invalidate_cache(config_name)
         return True, f"Snapshot {snapshot_number} deleted."
     return False, result.stderr.strip() or f"Failed to delete snapshot {snapshot_number}"
