@@ -586,7 +586,7 @@ class SnappyApp(App):
                 snap.type,
                 snap.date,
                 snap.description[:50],
-                snap.used_space or "-",
+                _fmt_size(int(snap.used_space)) if snap.used_space else "-",
                 snap.cleanup,
                 "yes" if snap.read_only else "no",
                 key=str(snap.number),
