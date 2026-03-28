@@ -581,7 +581,7 @@ class SnappyApp(App):
         pane.mount(status)
 
         table.cursor_type = "row"
-        col_keys = table.add_columns("#", "Type", "Date", "Description", "Used Space", "Cleanup", "RO")
+        col_keys = table.add_columns("#", "Type", "Date ↓", "Description", "Used Space", "Cleanup", "RO")
         self._desc_column_keys[config_name] = col_keys[3]
 
         for snap in reversed(snaps):  # newest first
