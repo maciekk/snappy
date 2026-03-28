@@ -375,7 +375,7 @@ class SnappyApp(App):
         color: $success;
     }
     #sudo-status.sudo-warn {
-        color: $warning;
+        color: $accent;
     }
     #sudo-status.sudo-expired {
         color: $error;
@@ -441,13 +441,15 @@ class SnappyApp(App):
         self._load_data()
         if not backend.is_root():
             self._update_sudo_status()
-            self.set_interval(15, self._update_sudo_status)
+            self.set_interval(10, self._update_sudo_status)
 
     @work(thread=True)
     def _update_sudo_status(self) -> None:
-        """Update the sudo countdown in the status bar."""
+        """Update the sudo countdown; keep credentials alive when close to expiry."""
         remaining = backend.sudo_seconds_remaining()
-        # When estimate says expired or close, do a real check to confirm
+        # Keep-alive: if 30s or less remain, attempt a silent refresh via check_sudo().
+        # On success, _sudo_last_confirmed resets and remaining jumps back to ~5m.
+        # On failure, remaining stays at 0 and we show the expiry warning.
         if remaining is not None and remaining <= 30:
             if backend.check_sudo():
                 remaining = backend.sudo_seconds_remaining()
@@ -463,8 +465,8 @@ class SnappyApp(App):
         if remaining == 0:
             widget.update("sudo: EXPIRED — run 'sudo -v' in another terminal, then press r")
             widget.set_classes("sudo-expired")
-        elif remaining <= 60:
-            widget.update(f"sudo: expires in {remaining}s — run 'sudo -v' in another terminal to refresh")
+        elif remaining < 60:
+            widget.update(f"sudo: {remaining}s remaining")
             widget.set_classes("sudo-warn")
         else:
             minutes = remaining // 60
