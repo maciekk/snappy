@@ -51,6 +51,23 @@ def _pct(used: int, total: int) -> str:
     return f"{used / total * 100:.1f}%"
 
 
+_BAR_STEPS = " ▏▎▍▌▋▊▉█"  # 9 steps: index 0 = empty, index 8 = full block
+
+def _make_bar(fraction: float, width: int = 8) -> str:
+    """Return a Unicode block progress bar of `width` chars for fraction 0.0–1.0."""
+    if fraction <= 0:
+        return " " * width
+    fraction = min(fraction, 1.0)
+    total_eighths = round(fraction * width * 8)
+    full = total_eighths // 8
+    remainder = total_eighths % 8
+    bar = "█" * full
+    if remainder and full < width:
+        bar += _BAR_STEPS[remainder]
+        full += 1
+    return bar.ljust(width)
+
+
 # ── Braille Spinner ──────────────────────────────────────────────────────
 
 class BrailleSpinner(Widget):
@@ -189,21 +206,15 @@ class BrowseScreen(ModalScreen):
         height: 90%;
         border: thick $secondary;
         background: $surface;
-        padding: 1 2;
-    }
-    #browse-layout {
-        height: 1fr;
+        padding: 0 2 1 2;
     }
     #browse-tree {
-        width: 2fr;
+        height: 1fr;
     }
     #browse-detail {
-        width: 1fr;
-        border-left: tall $accent;
+        height: auto;
+        border-top: tall $accent;
         padding: 0 1;
-    }
-    .detail-label {
-        margin-bottom: 0;
     }
     """
 
@@ -211,6 +222,11 @@ class BrowseScreen(ModalScreen):
         super().__init__()
         self.snapshot_path = snapshot_path
         self.snapshot_label = snapshot_label
+        # Maps parent_path_str -> {child_path_str -> (tree_node, size_bytes)}
+        self._level_sizes: dict[str, dict[str, tuple]] = {}
+        self._sudo_expired_du_shown: bool = False
+        # Path of the deepest expanded directory; its children show bright bars
+        self._active_level_path: str | None = None
 
     # Sentinel used as placeholder data to detect un-loaded directory nodes.
     _LOADING = object()
@@ -218,10 +234,8 @@ class BrowseScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="browse-dialog"):
             yield Label(f"Browsing: [bold]{self.snapshot_label}[/bold]  ({self.snapshot_path})")
-            with Horizontal(id="browse-layout"):
-                yield Tree("Loading…", id="browse-tree")
-                with Vertical(id="browse-detail"):
-                    yield Static("Select a file to see details", id="detail-info")
+            yield Tree("Loading…", id="browse-tree")
+            yield Static("", id="browse-detail")
 
     def on_mount(self) -> None:
         self._load_dir_node(self.query_one("#browse-tree", Tree).root, self.snapshot_path)
@@ -247,23 +261,116 @@ class BrowseScreen(ModalScreen):
     ) -> None:
         if node.is_root:
             node.set_label(str(path))
+
+        path_str = str(path)
+        level_map: dict[str, tuple] = {}
+
         for entry in entries:
             if entry.is_dir:
-                child = node.add(entry.name, data=entry)
+                child = node.add(Text(entry.name, style="bold"), data=entry)
                 child.add("…", data=self._LOADING)
+                level_map[entry.path] = (child, 0)
             else:
-                node.add_leaf(entry.name, data=entry)
+                leaf = node.add_leaf(Text(entry.name), data=entry)
+                level_map[entry.path] = (leaf, entry.size)
+
+        self._level_sizes[path_str] = level_map
+        if self._active_level_path is None:
+            self._active_level_path = path_str
+        self._redraw_level_bars(path_str)
+
+        for entry in entries:
+            if entry.is_dir:
+                child_node = level_map[entry.path][0]
+                self._fetch_dir_size(path_str, entry.path, child_node)
+
         if node.is_root:
             node.expand()
+
+    @work(thread=True)
+    def _fetch_dir_size(self, parent_path_str: str, dir_path_str: str, node) -> None:
+        try:
+            size = backend.get_dir_size(dir_path_str)
+        except backend.SudoExpiredError:
+            self.app.call_from_thread(self._on_du_sudo_expired)
+            return
+        except Exception as e:
+            log.warning("du failed for '%s': %s", dir_path_str, e)
+            return
+        self.app.call_from_thread(
+            self._on_dir_size_ready, parent_path_str, dir_path_str, node, size
+        )
+
+    def _on_dir_size_ready(
+        self, parent_path_str: str, dir_path_str: str, node, size: int
+    ) -> None:
+        level_map = self._level_sizes.get(parent_path_str)
+        if level_map is None or dir_path_str not in level_map:
+            return
+        level_map[dir_path_str] = (node, size)
+        self._redraw_level_bars(parent_path_str)
+
+    def _redraw_all_levels(self) -> None:
+        for path_str in list(self._level_sizes):
+            self._redraw_level_bars(path_str)
+
+    def _redraw_level_bars(self, parent_path_str: str) -> None:
+        level_map = self._level_sizes.get(parent_path_str)
+        if not level_map:
+            return
+        entries = [
+            (node, size, node.data)
+            for node, size in level_map.values()
+            if isinstance(node.data, backend.FileInfo)
+        ]
+        if not entries:
+            return
+        max_size = max((size for _node, size, _entry in entries), default=0)
+        max_name_len = max(len(entry.name) for _node, _size, entry in entries)
+        active = (parent_path_str == self._active_level_path)
+        bar_style = "dark_orange" if active else "dark_orange dim"
+        for node, size, entry in entries:
+            fraction = size / max_size if max_size > 0 else 0.0
+            bar = _make_bar(fraction)
+            size_str = _fmt_size(size) if size > 0 else "…"
+            label = Text()
+            label.append(entry.name.ljust(max_name_len), style="bold" if entry.is_dir else "")
+            label.append("  ")
+            label.append(bar, style=bar_style)
+            label.append(f" {size_str}", style="dim")
+            node.set_label(label)
+
+    def _on_du_sudo_expired(self) -> None:
+        if not self._sudo_expired_du_shown:
+            self._sudo_expired_du_shown = True
+            self.app.push_screen(SudoExpiredScreen())
 
     def on_tree_node_expanded(self, event: Tree.NodeExpanded) -> None:
         node = event.node
         if not isinstance(node.data, backend.FileInfo) or not node.data.is_dir:
             return
+        # Update active level before collapsing siblings so their collapse
+        # events don't incorrectly revert _active_level_path
+        self._active_level_path = str(node.data.path)
+        self._redraw_all_levels()
+        # Collapse all siblings — only one branch open at a time
+        if node.parent is not None:
+            for sibling in list(node.parent.children):
+                if sibling is not node and sibling.is_expanded:
+                    sibling.collapse()
         children = list(node.children)
         if len(children) == 1 and children[0].data is self._LOADING:
             node.remove_children()
             self._load_dir_node(node, Path(node.data.path))
+
+    def on_tree_node_collapsed(self, event: Tree.NodeCollapsed) -> None:
+        node = event.node
+        if not isinstance(node.data, backend.FileInfo) or not node.data.is_dir:
+            return
+        # If the active level was under this node, revert to its parent level
+        if self._active_level_path == str(node.data.path):
+            self._active_level_path = str(Path(node.data.path).parent)
+            self._redraw_all_levels()
 
     def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
         if isinstance(event.node.data, backend.FileInfo):
@@ -274,15 +381,32 @@ class BrowseScreen(ModalScreen):
             self._show_file_detail(event.node.data)
 
     def _show_file_detail(self, entry: backend.FileInfo) -> None:
-        detail = self.query_one("#detail-info", Static)
-        lines = [
-            f"[bold]Name:[/bold] {entry.name}",
-            f"[bold]Size:[/bold] {_fmt_size(entry.size)}",
-            f"[bold]Modified:[/bold] {_fmt_mtime(entry.mtime)}",
-            f"[bold]Permissions:[/bold] {entry.permissions}",
-            f"[bold]Type:[/bold] {'Directory' if entry.is_dir else 'File'}",
-        ]
-        detail.update("\n".join(lines))
+        detail = self.query_one("#browse-detail", Static)
+        size = entry.size
+        if entry.is_dir:
+            cached = backend.get_cached_dir_size(entry.path)
+            if cached is not None:
+                size = cached
+
+        parent_path_str = str(Path(entry.path).parent)
+        level_map = self._level_sizes.get(parent_path_str, {})
+        max_size = max((s for _n, s in level_map.values()), default=0)
+        fraction = size / max_size if max_size > 0 and size > 0 else 0.0
+        bar = _make_bar(fraction, width=12)
+
+        size_display = _fmt_size(size) if size > 0 else ("…" if entry.is_dir else "-")
+        kind = "Directory" if entry.is_dir else "File"
+        line1 = (
+            f"[bold]{entry.name}[/bold]"
+            f"  [dim]{kind}[/dim]"
+            f"  [bold]size:[/bold] {size_display}"
+            f"  [dark_orange]{bar}[/dark_orange] [dim]{int(fraction * 100)}%[/dim]"
+        )
+        line2 = (
+            f"[bold]modified:[/bold] {_fmt_mtime(entry.mtime)}"
+            f"  [bold]permissions:[/bold] {entry.permissions}"
+        )
+        detail.update(f"{line1}\n{line2}")
 
 
 # ── Delete Confirmation Screen ───────────────────────────────────────────

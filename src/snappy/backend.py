@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 
 _snapshot_cache: dict[str, list] = {}      # config_name -> list[Snapshot]
 _config_detail_cache: dict[str, dict] = {} # config_name -> dict[str, str]
+_dir_size_cache: dict[str, int] = {}       # abs path -> total bytes (from du -sb)
 
 
 def invalidate_cache(config_name: str | None = None) -> None:
@@ -31,6 +32,7 @@ def invalidate_cache(config_name: str | None = None) -> None:
     if config_name is None:
         _snapshot_cache.clear()
         _config_detail_cache.clear()
+        _dir_size_cache.clear()
         log.debug("Cache invalidated (all configs)")
     else:
         _snapshot_cache.pop(config_name, None)
@@ -382,6 +384,36 @@ def browse_directory(path: str | Path) -> list[FileInfo]:
         ))
     entries.sort(key=lambda e: (not e.is_dir, e.name.lower()))
     return entries
+
+
+def get_dir_size(path: str | Path) -> int:
+    """Return total disk usage of a directory tree in bytes (via sudo du -sb).
+
+    Results are cached by absolute path for the lifetime of the process.
+    Raises SudoExpiredError if sudo credentials have lapsed.
+    """
+    path_str = str(Path(path).resolve())
+    if path_str in _dir_size_cache:
+        log.debug("Cache hit: dir size for '%s'", path_str)
+        return _dir_size_cache[path_str]
+    result = _run_privileged(["du", "-sb", path_str])
+    for line in result.stdout.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            try:
+                size = int(parts[0])
+                _dir_size_cache[path_str] = size
+                log.debug("Dir size %s: %d bytes", path_str, size)
+                return size
+            except ValueError:
+                continue
+    log.warning("du produced no parseable output for '%s': %s", path_str, result.stderr.strip())
+    return 0
+
+
+def get_cached_dir_size(path: str | Path) -> int | None:
+    """Return the cached du size for path, or None if not yet computed."""
+    return _dir_size_cache.get(str(Path(path).resolve()))
 
 
 def find_file_in_snapshots(
