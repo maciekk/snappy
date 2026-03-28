@@ -233,7 +233,7 @@ class BrowseScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="browse-dialog"):
-            yield Label(f"Browsing: [bold]{self.snapshot_label}[/bold]  ({self.snapshot_path})")
+            yield Label(f"Browsing: [bold]{self.snapshot_label}[/bold]")
             yield Tree("Loading…", id="browse-tree")
             yield Static("", id="browse-detail")
 
@@ -396,15 +396,22 @@ class BrowseScreen(ModalScreen):
 
         size_display = _fmt_size(size) if size > 0 else ("…" if entry.is_dir else "-")
         kind = "Directory" if entry.is_dir else "File"
+
+        # Fixed-width columns so rows align; C1 fits "modified: 2024-01-15 10:30"
+        C1, C2, SEP = 28, 18, "  [dim]│[/dim]  "
+        def col(label: str, value: str, width: int) -> str:
+            pad = " " * max(0, width - len(label) - 2 - len(value))
+            return f"[bold dim]{label}:[/bold dim] {value}{pad}"
+
         line1 = (
-            f"[bold]{entry.name}[/bold]"
-            f"  [dim]{kind}[/dim]"
-            f"  [bold]size:[/bold] {size_display}"
-            f"  [dark_orange]{bar}[/dark_orange] [dim]{int(fraction * 100)}%[/dim]"
+            col("name", entry.name[:20], C1) + SEP +
+            col("type", kind, C2) + SEP +
+            f"[bold dim]size:[/bold dim] {size_display}  "
+            f"[dark_orange]{bar}[/dark_orange] [dim]{int(fraction * 100)}%[/dim]"
         )
         line2 = (
-            f"[bold]modified:[/bold] {_fmt_mtime(entry.mtime)}"
-            f"  [bold]permissions:[/bold] {entry.permissions}"
+            col("modified", _fmt_mtime(entry.mtime), C1) + SEP +
+            col("perms", entry.permissions, C2) + SEP
         )
         detail.update(f"{line1}\n{line2}")
 
@@ -824,7 +831,12 @@ class SnappyApp(App):
         snap_num = self._get_selected_snapshot_number()
         if cfg and snap_num:
             snap_path = backend.get_snapshot_path(cfg, snap_num)
+            snaps = backend.get_snapshots(cfg.name)
+            snap = next((s for s in snaps if s.number == snap_num), None)
+            size_str = _fmt_size(int(snap.used_space)) if snap and snap.used_space else ""
             label = f"Config: {cfg.name}  Snapshot: #{snap_num}"
+            if size_str:
+                label += f"  ({size_str})"
             self.push_screen(BrowseScreen(snap_path, label))
 
     def action_delete_snapshot(self) -> None:
