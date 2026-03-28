@@ -424,6 +424,7 @@ class SnappyApp(App):
         self.configs: list[backend.SnapperConfig] = []
         self.fs_usage: backend.FilesystemUsage | None = None
         self._loaded_configs: set[str] = set()  # configs whose snapshots have been fetched
+        self._desc_column_keys: dict[str, object] = {}  # config_name -> description ColumnKey
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -572,7 +573,8 @@ class SnappyApp(App):
         pane.mount(status)
 
         table.cursor_type = "row"
-        table.add_columns("#", "Type", "Date", "Description", "Used Space", "Cleanup", "RO")
+        col_keys = table.add_columns("#", "Type", "Date", "Description", "Used Space", "Cleanup", "RO")
+        self._desc_column_keys[config_name] = col_keys[3]
 
         for snap in reversed(snaps):  # newest first
             if snap.number == 0:
@@ -590,6 +592,41 @@ class SnappyApp(App):
 
         count = len([s for s in snaps if s.number != 0])
         self.query_one(f"#status-{config_name}", Static).update(f"{count} snapshots")
+        self.call_after_refresh(self._fit_description_column, table, config_name)
+
+    def _fit_description_column(self, table: DataTable, config_name: str) -> None:
+        """Expand the Description column to fill available horizontal space."""
+        desc_key = self._desc_column_keys.get(config_name)
+        if desc_key is None or desc_key not in table.columns:
+            return
+        total_width = table.size.width
+        if total_width == 0:
+            return
+        desc_col = table.columns[desc_key]
+        other_width = sum(
+            col.get_render_width(table)
+            for key, col in table.columns.items()
+            if key != desc_key
+        )
+        available = total_width - other_width - 2 * table.cell_padding
+        if available < 1:
+            return
+        desc_col.auto_width = False
+        desc_col.width = available
+        table._require_update_dimensions = True
+        table.refresh()
+
+    def on_resize(self) -> None:
+        """Re-fit the Description column for all loaded tables when the terminal is resized."""
+        self.call_after_refresh(self._fit_all_description_columns)
+
+    def _fit_all_description_columns(self) -> None:
+        for config_name in self._loaded_configs:
+            try:
+                table = self.query_one(f"#table-{config_name}", DataTable)
+            except Exception:
+                continue
+            self._fit_description_column(table, config_name)
 
     def _show_sudo_expired(self) -> None:
         self._update_sudo_status()
