@@ -91,7 +91,7 @@ class FileSearchScreen(ModalScreen):
     #search-dialog {
         width: 90%;
         height: 85%;
-        border: thick $accent;
+        border: thick $secondary;
         background: $surface;
         padding: 1 2;
     }
@@ -180,7 +180,7 @@ class BrowseScreen(ModalScreen):
     #browse-dialog {
         width: 95%;
         height: 90%;
-        border: thick $accent;
+        border: thick $secondary;
         background: $surface;
         padding: 1 2;
     }
