@@ -479,9 +479,9 @@ class SnappyApp(App):
         for cfg in self.configs:
             try:
                 pane = self.query_one(f"#tab-{cfg.name}", TabPane)
-                pane.mount(BrailleSpinner(id=f"spinner-{cfg.name}"))
                 pane.mount(Static("Loading snapshots…", id=f"loading-label-{cfg.name}",
                                   classes="status-bar"))
+                pane.mount(BrailleSpinner(id=f"spinner-{cfg.name}"))
             except Exception:
                 pass
         # Load only the active tab now
@@ -593,9 +593,9 @@ class SnappyApp(App):
             try:
                 pane = self.query_one(f"#tab-{c.name}", TabPane)
                 pane.query("*").remove()
-                pane.mount(BrailleSpinner(id=f"spinner-{c.name}"))
                 pane.mount(Static("Loading snapshots…", id=f"loading-label-{c.name}",
                                   classes="status-bar"))
+                pane.mount(BrailleSpinner(id=f"spinner-{c.name}"))
             except Exception:
                 pass
         # Load the currently active tab right away
