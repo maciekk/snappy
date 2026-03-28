@@ -19,10 +19,10 @@ from textual.widgets import (
     Header,
     Input,
     Label,
+    LoadingIndicator,
     Static,
     TabbedContent,
     TabPane,
-    Tree,
 )
 
 from snappy import backend
@@ -78,6 +78,10 @@ class FileSearchScreen(ModalScreen):
         color: $text-muted;
         margin-bottom: 1;
     }
+    #search-loading {
+        height: 3;
+        display: none;
+    }
     """
 
     def __init__(self, config: backend.SnapperConfig) -> None:
@@ -92,6 +96,7 @@ class FileSearchScreen(ModalScreen):
                 id="search-hint",
             )
             yield Input(placeholder="relative/path/to/file", id="search-input")
+            yield LoadingIndicator(id="search-loading")
             yield DataTable(id="search-results")
 
     def on_mount(self) -> None:
@@ -103,6 +108,7 @@ class FileSearchScreen(ModalScreen):
         relative_path = event.value.strip()
         if not relative_path:
             return
+        self.query_one("#search-loading", LoadingIndicator).styles.display = "block"
         self._do_search(relative_path)
 
     @work(thread=True)
@@ -111,6 +117,7 @@ class FileSearchScreen(ModalScreen):
         self.app.call_from_thread(self._populate_results, results)
 
     def _populate_results(self, results: list[backend.FileInSnapshot]) -> None:
+        self.query_one("#search-loading", LoadingIndicator).styles.display = "none"
         table = self.query_one("#search-results", DataTable)
         table.clear()
         for r in results:
@@ -268,6 +275,18 @@ class SnappyApp(App):
         padding: 0 1;
         color: $text-muted;
     }
+    #loading-container {
+        height: auto;
+        padding: 1 2;
+        align: center middle;
+    }
+    #loading-indicator {
+        height: 3;
+    }
+    #loading-text {
+        text-align: center;
+        color: $text-muted;
+    }
     """
 
     BINDINGS = [
@@ -291,7 +310,10 @@ class SnappyApp(App):
                 " Note: sudo will be used for privileged commands — you may be prompted for your password",
                 id="root-warning",
             )
-        yield Static("Loading filesystem info...", id="fs-summary")
+        yield Static("", id="fs-summary")
+        with Vertical(id="loading-container"):
+            yield LoadingIndicator(id="loading-indicator")
+            yield Static("Reading snapshots — this can take a while...", id="loading-text")
         yield TabbedContent(id="config-tabs")
         yield Footer()
 
@@ -316,6 +338,12 @@ class SnappyApp(App):
         self.configs = configs
         self.snapshots = snapshots
         self.fs_usage = fs_usage
+
+        # Hide loading indicator
+        try:
+            self.query_one("#loading-container").remove()
+        except Exception:
+            pass
 
         # Filesystem summary
         summary = self.query_one("#fs-summary", Static)
@@ -403,6 +431,12 @@ class SnappyApp(App):
         # Clear and reload
         tabs = self.query_one("#config-tabs", TabbedContent)
         tabs.clear_panes()
+        loading = Vertical(
+            LoadingIndicator(id="loading-indicator"),
+            Static("Reading snapshots — this can take a while...", id="loading-text"),
+            id="loading-container",
+        )
+        self.mount(loading, before="#config-tabs")
         self._load_data()
 
     def action_file_search(self) -> None:
