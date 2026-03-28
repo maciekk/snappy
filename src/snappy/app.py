@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import os
+import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +26,8 @@ from textual.widgets import (
 )
 
 from snappy import backend
+
+log = logging.getLogger(__name__)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -113,8 +115,16 @@ class FileSearchScreen(ModalScreen):
 
     @work(thread=True)
     def _do_search(self, relative_path: str) -> None:
-        results = backend.find_file_in_snapshots(self.config, relative_path)
+        try:
+            results = backend.find_file_in_snapshots(self.config, relative_path)
+        except backend.SudoExpiredError:
+            self.app.call_from_thread(self._on_sudo_expired_search)
+            return
         self.app.call_from_thread(self._populate_results, results)
+
+    def _on_sudo_expired_search(self) -> None:
+        self.query_one("#search-loading", LoadingIndicator).styles.display = "none"
+        self.app.push_screen(SudoExpiredScreen())
 
     def _populate_results(self, results: list[backend.FileInSnapshot]) -> None:
         self.query_one("#search-loading", LoadingIndicator).styles.display = "none"
@@ -243,6 +253,38 @@ class ConfirmDeleteScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+# ── Sudo Expired Screen ─────────────────────────────────────────────────
+
+class SudoExpiredScreen(ModalScreen):
+    """Inform the user that sudo has expired."""
+
+    BINDINGS = [
+        Binding("escape,enter", "dismiss", "OK"),
+    ]
+
+    CSS = """
+    SudoExpiredScreen {
+        align: center middle;
+    }
+    #sudo-dialog {
+        width: 70;
+        height: 12;
+        border: thick $warning;
+        background: $surface;
+        padding: 1 2;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="sudo-dialog"):
+            yield Label("[bold]sudo credentials have expired[/bold]")
+            yield Label("")
+            yield Label("Please run [bold]sudo -v[/bold] in another terminal to refresh,")
+            yield Label("then press [bold]r[/bold] here to retry.")
+            yield Label("")
+            yield Label("[Enter/Esc] Dismiss")
+
+
 # ── Main App ─────────────────────────────────────────────────────────────
 
 class SnappyApp(App):
@@ -256,7 +298,21 @@ class SnappyApp(App):
         height: auto;
         padding: 0 1;
         background: $boost;
+    }
+    #sudo-status {
+        height: auto;
+        padding: 0 1;
+        background: $boost;
         margin-bottom: 1;
+    }
+    #sudo-status.sudo-ok {
+        color: $success;
+    }
+    #sudo-status.sudo-warn {
+        color: $warning;
+    }
+    #sudo-status.sudo-expired {
+        color: $error;
     }
     #root-warning {
         background: $warning;
@@ -305,12 +361,9 @@ class SnappyApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        if not backend.is_root():
-            yield Static(
-                " Note: sudo will be used for privileged commands — you may be prompted for your password",
-                id="root-warning",
-            )
         yield Static("", id="fs-summary")
+        if not backend.is_root():
+            yield Static("", id="sudo-status")
         with Vertical(id="loading-container"):
             yield LoadingIndicator(id="loading-indicator")
             yield Static("Reading snapshots — this can take a while...", id="loading-text")
@@ -319,14 +372,51 @@ class SnappyApp(App):
 
     def on_mount(self) -> None:
         self._load_data()
+        if not backend.is_root():
+            self._update_sudo_status()
+            self.set_interval(15, self._update_sudo_status)
+
+    @work(thread=True)
+    def _update_sudo_status(self) -> None:
+        """Update the sudo countdown in the status bar."""
+        remaining = backend.sudo_seconds_remaining()
+        # When estimate says expired or close, do a real check to confirm
+        if remaining is not None and remaining <= 30:
+            if backend.check_sudo():
+                remaining = backend.sudo_seconds_remaining()
+        self.app.call_from_thread(self._render_sudo_status, remaining)
+
+    def _render_sudo_status(self, remaining: int | None) -> None:
+        try:
+            widget = self.query_one("#sudo-status", Static)
+        except Exception:
+            return
+        if remaining is None:
+            return
+        if remaining == 0:
+            widget.update("sudo: EXPIRED — run 'sudo -v' in another terminal, then press r")
+            widget.set_classes("sudo-expired")
+        elif remaining <= 60:
+            widget.update(f"sudo: expires in {remaining}s — run 'sudo -v' in another terminal to refresh")
+            widget.set_classes("sudo-warn")
+        else:
+            minutes = remaining // 60
+            secs = remaining % 60
+            widget.update(f"sudo: {minutes}m {secs:02d}s remaining")
+            widget.set_classes("sudo-ok")
 
     @work(thread=True)
     def _load_data(self) -> None:
         configs = backend.get_configs()
         fs_usage = backend.get_filesystem_usage()
-        snapshots = {}
+        snapshots: dict[str, list[backend.Snapshot]] = {}
         for cfg in configs:
-            snapshots[cfg.name] = backend.get_snapshots(cfg.name)
+            try:
+                snapshots[cfg.name] = backend.get_snapshots(cfg.name)
+            except backend.SudoExpiredError:
+                log.warning("sudo expired while loading snapshots for '%s'", cfg.name)
+                self.app.call_from_thread(self._show_sudo_expired)
+                snapshots[cfg.name] = []
         self.app.call_from_thread(self._populate, configs, snapshots, fs_usage)
 
     def _populate(
@@ -402,6 +492,10 @@ class SnappyApp(App):
             status_widget = self.query_one(f"#status-{cfg.name}", Static)
             status_widget.update(f"{count} snapshots")
 
+    def _show_sudo_expired(self) -> None:
+        self._update_sudo_status()
+        self.push_screen(SudoExpiredScreen())
+
     def _get_active_config(self) -> backend.SnapperConfig | None:
         tabs = self.query_one("#config-tabs", TabbedContent)
         active_id = tabs.active
@@ -471,7 +565,11 @@ class SnappyApp(App):
 
     @work(thread=True)
     def _do_delete(self, config_name: str, snap_num: int) -> None:
-        ok, msg = backend.delete_snapshot(config_name, snap_num)
+        try:
+            ok, msg = backend.delete_snapshot(config_name, snap_num)
+        except backend.SudoExpiredError:
+            self.app.call_from_thread(self._show_sudo_expired)
+            return
         self.app.call_from_thread(self._on_delete_done, ok, msg)
 
     def _on_delete_done(self, ok: bool, msg: str) -> None:

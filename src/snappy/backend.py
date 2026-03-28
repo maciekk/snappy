@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+# ── Sudo tracking ──────────────────────────────────────────────────────
+
+_sudo_last_confirmed: float = 0.0  # monotonic timestamp of last successful sudo check
+_sudo_timeout: int = 0  # configured sudo timeout in seconds (0 = unknown)
 
 
 @dataclass
@@ -67,33 +76,129 @@ def is_root() -> bool:
     return os.geteuid() == 0
 
 
-def _run(cmd: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
+def get_sudo_timeout() -> int:
+    """Query the configured sudo timestamp_timeout (seconds). Returns 0 if unknown."""
+    global _sudo_timeout
+    if _sudo_timeout > 0:
+        return _sudo_timeout
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(
+            ["sudo", "-n", "-l"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            # Look for "timestamp_timeout" in sudo -l output
+            if "timestamp_timeout" in line:
+                # e.g. "    timestamp_timeout    5"  or  "timestamp_timeout=5"
+                for token in re.split(r"[=\s]+", line):
+                    try:
+                        val = float(token)
+                        _sudo_timeout = int(val * 60)  # sudo uses minutes
+                        log.info("Detected sudo timeout: %d seconds", _sudo_timeout)
+                        return _sudo_timeout
+                    except ValueError:
+                        continue
+    except Exception:
+        pass
+    # Default: 5 minutes is the sudo default
+    _sudo_timeout = 300
+    log.info("Using default sudo timeout: %d seconds", _sudo_timeout)
+    return _sudo_timeout
+
+
+def check_sudo() -> bool:
+    """Check if sudo credentials are currently cached (non-interactive)."""
+    global _sudo_last_confirmed
+    if is_root():
+        return True
+    result = subprocess.run(
+        ["sudo", "-n", "true"], capture_output=True, timeout=5,
+    )
+    if result.returncode == 0:
+        _sudo_last_confirmed = time.monotonic()
+        return True
+    return False
+
+
+def sudo_seconds_remaining() -> int | None:
+    """Estimate seconds until sudo credentials expire.
+
+    Returns None if running as root (no expiry), or if we have never
+    confirmed sudo.  Returns 0 if already expired.
+    """
+    if is_root():
+        return None
+    if _sudo_last_confirmed == 0.0:
+        return 0
+    timeout = get_sudo_timeout()
+    elapsed = time.monotonic() - _sudo_last_confirmed
+    remaining = max(0, int(timeout - elapsed))
+    return remaining
+
+
+class SudoExpiredError(Exception):
+    """Raised when a privileged command cannot run because sudo has expired."""
+
+
+def _run(cmd: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
+    log.debug("Running: %s", cmd)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
+        log.warning("Command timed out after %ds: %s", timeout, cmd)
         return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="Command timed out")
+    if result.returncode != 0:
+        log.warning("Command failed (rc=%d): %s\nstderr: %s", result.returncode, cmd, result.stderr.strip())
+    else:
+        log.debug("Command succeeded: %s (stdout %d bytes)", cmd, len(result.stdout))
+    return result
 
 
 def _run_privileged(cmd: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
-    """Run a command, using sudo if not already root."""
+    """Run a command, using sudo if not already root.
+
+    Raises SudoExpiredError if sudo credentials have expired.
+    """
+    global _sudo_last_confirmed
     if os.geteuid() == 0:
         return _run(cmd, timeout)
-    return _run(["sudo"] + cmd, timeout)
+    # Quick non-interactive check before attempting the real command
+    if not check_sudo():
+        log.warning("sudo credentials expired before running: %s", cmd)
+        raise SudoExpiredError("sudo credentials have expired")
+    result = _run(["sudo"] + cmd, timeout)
+    if result.returncode == 0:
+        _sudo_last_confirmed = time.monotonic()
+    return result
 
 
 def get_configs() -> list[SnapperConfig]:
     result = _run(["snapper", "--jsonout", "list-configs"])
     if result.returncode != 0:
+        log.error("Failed to list snapper configs")
         return []
-    data = json.loads(result.stdout)
-    return [SnapperConfig(name=c["config"], subvolume=c["subvolume"]) for c in data.get("configs", [])]
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        log.error("Invalid JSON from snapper list-configs: %s", result.stdout[:200])
+        return []
+    configs = [SnapperConfig(name=c["config"], subvolume=c["subvolume"]) for c in data.get("configs", [])]
+    # Sort: root subvolume "/" first, then alphabetically by subvolume
+    configs.sort(key=lambda c: (c.subvolume != "/", c.subvolume))
+    log.info("Found %d snapper configs: %s", len(configs), [c.name for c in configs])
+    return configs
 
 
 def get_snapshots(config_name: str) -> list[Snapshot]:
     result = _run_privileged(["snapper", "--jsonout", "-c", config_name, "list"])
     if result.returncode != 0:
+        log.error("Failed to list snapshots for config '%s'", config_name)
         return []
-    data = json.loads(result.stdout)
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        log.error("Invalid JSON from snapper list (config '%s'): %s", config_name, result.stdout[:200])
+        return []
     snapshots = []
     for s in data.get("snapshots", []):
         userdata = s.get("userdata", {})
@@ -118,8 +223,13 @@ def get_snapshots(config_name: str) -> list[Snapshot]:
 def get_config_details(config_name: str) -> dict[str, str]:
     result = _run_privileged(["snapper", "--jsonout", "-c", config_name, "get-config"])
     if result.returncode != 0:
+        log.error("Failed to get config details for '%s'", config_name)
         return {}
-    return json.loads(result.stdout)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        log.error("Invalid JSON from snapper get-config (config '%s'): %s", config_name, result.stdout[:200])
+        return {}
 
 
 def _parse_size(s: str) -> int:
