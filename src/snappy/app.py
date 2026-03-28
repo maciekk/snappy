@@ -7,11 +7,13 @@ from datetime import datetime
 from pathlib import Path
 
 import humanize
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
+from textual.widget import Widget
 from textual.widgets import (
     DataTable,
     DirectoryTree,
@@ -19,7 +21,6 @@ from textual.widgets import (
     Header,
     Input,
     Label,
-    LoadingIndicator,
     Static,
     TabbedContent,
     TabPane,
@@ -48,6 +49,30 @@ def _pct(used: int, total: int) -> str:
     if total <= 0:
         return "?"
     return f"{used / total * 100:.1f}%"
+
+
+# ── Braille Spinner ──────────────────────────────────────────────────────
+
+class BrailleSpinner(Widget):
+    """Single-character animated braille spinner in orange."""
+
+    _FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    DEFAULT_CSS = """
+    BrailleSpinner {
+        width: auto;
+        height: 1;
+        color: orange;
+    }
+    """
+
+    def on_mount(self) -> None:
+        self.auto_refresh = 1 / 10
+
+    def render(self) -> Text:
+        from time import time
+        frame = self._FRAMES[int(time() * 10) % len(self._FRAMES)]
+        return Text(frame, style="bold orange")
 
 
 # ── File Search Screen ───────────────────────────────────────────────────
@@ -81,7 +106,7 @@ class FileSearchScreen(ModalScreen):
         margin-bottom: 1;
     }
     #search-loading {
-        height: 3;
+        height: 1;
         display: none;
     }
     """
@@ -98,7 +123,7 @@ class FileSearchScreen(ModalScreen):
                 id="search-hint",
             )
             yield Input(placeholder="relative/path/to/file", id="search-input")
-            yield LoadingIndicator(id="search-loading")
+            yield BrailleSpinner(id="search-loading")
             yield DataTable(id="search-results")
 
     def on_mount(self) -> None:
@@ -110,7 +135,7 @@ class FileSearchScreen(ModalScreen):
         relative_path = event.value.strip()
         if not relative_path:
             return
-        self.query_one("#search-loading", LoadingIndicator).styles.display = "block"
+        self.query_one("#search-loading", BrailleSpinner).styles.display = "block"
         self._do_search(relative_path)
 
     @work(thread=True)
@@ -123,11 +148,11 @@ class FileSearchScreen(ModalScreen):
         self.app.call_from_thread(self._populate_results, results)
 
     def _on_sudo_expired_search(self) -> None:
-        self.query_one("#search-loading", LoadingIndicator).styles.display = "none"
+        self.query_one("#search-loading", BrailleSpinner).styles.display = "none"
         self.app.push_screen(SudoExpiredScreen())
 
     def _populate_results(self, results: list[backend.FileInSnapshot]) -> None:
-        self.query_one("#search-loading", LoadingIndicator).styles.display = "none"
+        self.query_one("#search-loading", BrailleSpinner).styles.display = "none"
         table = self.query_one("#search-results", DataTable)
         table.clear()
         for r in results:
@@ -337,7 +362,7 @@ class SnappyApp(App):
         align: center middle;
     }
     #loading-indicator {
-        height: 3;
+        height: 1;
     }
     #loading-text {
         text-align: center;
@@ -365,7 +390,7 @@ class SnappyApp(App):
         if not backend.is_root():
             yield Static("", id="sudo-status")
         with Vertical(id="loading-container"):
-            yield LoadingIndicator(id="loading-indicator")
+            yield BrailleSpinner(id="loading-indicator")
             yield Static("Reading snapshots — this can take a while...", id="loading-text")
         yield TabbedContent(id="config-tabs")
         yield Footer()
@@ -526,7 +551,7 @@ class SnappyApp(App):
         tabs = self.query_one("#config-tabs", TabbedContent)
         tabs.clear_panes()
         loading = Vertical(
-            LoadingIndicator(id="loading-indicator"),
+            BrailleSpinner(id="loading-indicator"),
             Static("Reading snapshots — this can take a while...", id="loading-text"),
             id="loading-container",
         )
