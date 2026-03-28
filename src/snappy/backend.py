@@ -22,9 +22,10 @@ log = logging.getLogger(__name__)
 # transparent to them.  Call invalidate_cache() after any mutating
 # operation (e.g. delete) so subsequent reads are fresh.
 
-_snapshot_cache: dict[str, list] = {}      # config_name -> list[Snapshot]
-_config_detail_cache: dict[str, dict] = {} # config_name -> dict[str, str]
-_dir_size_cache: dict[str, int] = {}       # abs path -> total bytes (from du -sb)
+_snapshot_cache: dict[str, list] = {}          # config_name -> list[Snapshot]
+_config_detail_cache: dict[str, dict] = {}     # config_name -> dict[str, str]
+_dir_size_cache: dict[str, int] = {}           # abs path -> total bytes (from du -sb)
+_status_cache: dict[tuple, set[str]] = {}      # (config_name, snap_num) -> set of rel paths
 
 
 def invalidate_cache(config_name: str | None = None) -> None:
@@ -33,6 +34,7 @@ def invalidate_cache(config_name: str | None = None) -> None:
         _snapshot_cache.clear()
         _config_detail_cache.clear()
         _dir_size_cache.clear()
+        _status_cache.clear()
         log.debug("Cache invalidated (all configs)")
     else:
         _snapshot_cache.pop(config_name, None)
@@ -414,6 +416,30 @@ def get_dir_size(path: str | Path) -> int:
 def get_cached_dir_size(path: str | Path) -> int | None:
     """Return the cached du size for path, or None if not yet computed."""
     return _dir_size_cache.get(str(Path(path).resolve()))
+
+
+def get_snapshot_status(config_name: str, snap_num: int) -> set[str]:
+    """Return paths (relative to subvolume root) that differ between snap_num and current.
+
+    Runs: snapper -c <config_name> status <snap_num>..0
+    Output lines look like: 'c..... /etc/fstab'
+    Results are cached; snapshots are immutable so the cache never expires.
+    Raises SudoExpiredError if credentials have lapsed.
+    """
+    key = (config_name, snap_num)
+    if key in _status_cache:
+        log.debug("Cache hit: status for %s #%d", config_name, snap_num)
+        return _status_cache[key]
+    result = _run_privileged(["snapper", "-c", config_name, "status", f"{snap_num}..0"])
+    changed: set[str] = set()
+    for line in result.stdout.splitlines():
+        # Format: 6 status chars, space, absolute path from subvolume root
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            changed.add(parts[1])
+    log.debug("Status for %s #%d: %d changed paths", config_name, snap_num, len(changed))
+    _status_cache[key] = changed
+    return changed
 
 
 def find_file_in_snapshots(

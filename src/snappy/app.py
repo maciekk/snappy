@@ -218,15 +218,25 @@ class BrowseScreen(ModalScreen):
     }
     """
 
-    def __init__(self, snapshot_path: Path, snapshot_label: str) -> None:
+    def __init__(
+        self,
+        snapshot_path: Path,
+        snapshot_label: str,
+        config_name: str | None = None,
+        snap_num: int | None = None,
+    ) -> None:
         super().__init__()
         self.snapshot_path = snapshot_path
         self.snapshot_label = snapshot_label
+        self._config_name = config_name
+        self._snap_num = snap_num
         # Maps parent_path_str -> {child_path_str -> (tree_node, size_bytes)}
         self._level_sizes: dict[str, dict[str, tuple]] = {}
         self._sudo_expired_du_shown: bool = False
         # Path of the deepest expanded directory; its children show bright bars
         self._active_level_path: str | None = None
+        # Absolute snapshot paths that differ from current filesystem; None = not yet loaded
+        self._changed_paths: set[str] | None = None
 
     # Sentinel used as placeholder data to detect un-loaded directory nodes.
     _LOADING = object()
@@ -239,6 +249,8 @@ class BrowseScreen(ModalScreen):
 
     def on_mount(self) -> None:
         self._load_dir_node(self.query_one("#browse-tree", Tree).root, self.snapshot_path)
+        if self._config_name and self._snap_num is not None:
+            self._fetch_snapshot_status(self._config_name, self._snap_num)
 
     @work(thread=True)
     def _load_dir_node(self, node, path: Path) -> None:
@@ -333,8 +345,17 @@ class BrowseScreen(ModalScreen):
             fraction = size / max_size if max_size > 0 else 0.0
             bar = _make_bar(fraction)
             size_str = _fmt_size(size) if size > 0 else "…"
+            if self._changed_paths is None:
+                # Status not yet loaded — no dimming
+                changed = True
+            else:
+                changed = entry.path in self._changed_paths
             label = Text()
-            label.append(entry.name.ljust(max_name_len), style="bold" if entry.is_dir else "")
+            if entry.is_dir:
+                name_style = "bold"
+            else:
+                name_style = "" if changed else "dim"
+            label.append(entry.name.ljust(max_name_len), style=name_style)
             label.append("  ")
             label.append(bar, style=bar_style)
             label.append(f" {size_str}", style="dim")
@@ -344,6 +365,23 @@ class BrowseScreen(ModalScreen):
         if not self._sudo_expired_du_shown:
             self._sudo_expired_du_shown = True
             self.app.push_screen(SudoExpiredScreen())
+
+    @work(thread=True)
+    def _fetch_snapshot_status(self, config_name: str, snap_num: int) -> None:
+        try:
+            rel_paths = backend.get_snapshot_status(config_name, snap_num)
+        except backend.SudoExpiredError:
+            return
+        except Exception as e:
+            log.warning("snapper status failed: %s", e)
+            return
+        # Convert relative paths (e.g. "/etc/fstab") to absolute snapshot paths
+        changed = {str(self.snapshot_path / p.lstrip("/")) for p in rel_paths}
+        self.app.call_from_thread(self._on_status_ready, changed)
+
+    def _on_status_ready(self, changed: set[str]) -> None:
+        self._changed_paths = changed
+        self._redraw_all_levels()
 
     def on_tree_node_expanded(self, event: Tree.NodeExpanded) -> None:
         node = event.node
@@ -837,7 +875,7 @@ class SnappyApp(App):
             label = f"Config: {cfg.name}  Snapshot: #{snap_num}"
             if size_str:
                 label += f"  ({size_str})"
-            self.push_screen(BrowseScreen(snap_path, label))
+            self.push_screen(BrowseScreen(snap_path, label, cfg.name, snap_num))
 
     def action_delete_snapshot(self) -> None:
         cfg = self._get_active_config()
