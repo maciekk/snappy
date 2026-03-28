@@ -690,6 +690,11 @@ class SnappyApp(App):
         if cfg:
             self.push_screen(FileSearchScreen(cfg))
 
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        # Only act on the main snapshot tables, not the file-search results table
+        if event.data_table.id and event.data_table.id.startswith("table-"):
+            self.action_browse()
+
     def action_browse(self) -> None:
         cfg = self._get_active_config()
         snap_num = self._get_selected_snapshot_number()
