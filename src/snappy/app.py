@@ -54,7 +54,7 @@ def _pct(used: int, total: int) -> str:
 # ── Braille Spinner ──────────────────────────────────────────────────────
 
 class BrailleSpinner(Widget):
-    """Single-character animated braille spinner in orange."""
+    """Animated braille spinner with an optional inline label."""
 
     _FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
@@ -62,9 +62,12 @@ class BrailleSpinner(Widget):
     BrailleSpinner {
         width: auto;
         height: 1;
-        color: orange;
     }
     """
+
+    def __init__(self, label: str = "", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._label = label
 
     def on_mount(self) -> None:
         self.auto_refresh = 1 / 10
@@ -72,7 +75,11 @@ class BrailleSpinner(Widget):
     def render(self) -> Text:
         from time import time
         frame = self._FRAMES[int(time() * 10) % len(self._FRAMES)]
-        return Text(frame, style="bold orange")
+        text = Text()
+        if self._label:
+            text.append(self._label + " ", style="")
+        text.append(frame, style="bold dark_orange")
+        return text
 
 
 # ── File Search Screen ───────────────────────────────────────────────────
@@ -522,9 +529,8 @@ class SnappyApp(App):
         for cfg in self.configs:
             try:
                 pane = self.query_one(f"#tab-{cfg.name}", TabPane)
-                pane.mount(Static("Loading snapshots…", id=f"loading-label-{cfg.name}",
-                                  classes="status-bar"))
-                pane.mount(BrailleSpinner(id=f"spinner-{cfg.name}"))
+                pane.mount(BrailleSpinner("Loading snapshots…", id=f"spinner-{cfg.name}",
+                                         classes="status-bar"))
             except Exception:
                 pass
         # Load only the active tab now
@@ -562,8 +568,8 @@ class SnappyApp(App):
         except Exception:
             return
 
-        # Remove the placeholder spinner and label
-        for widget_id in (f"spinner-{config_name}", f"loading-label-{config_name}"):
+        # Remove the placeholder spinner
+        for widget_id in (f"spinner-{config_name}",):
             try:
                 pane.query_one(f"#{widget_id}").remove()
             except Exception:
@@ -672,9 +678,8 @@ class SnappyApp(App):
             try:
                 pane = self.query_one(f"#tab-{c.name}", TabPane)
                 pane.query("*").remove()
-                pane.mount(Static("Loading snapshots…", id=f"loading-label-{c.name}",
-                                  classes="status-bar"))
-                pane.mount(BrailleSpinner(id=f"spinner-{c.name}"))
+                pane.mount(BrailleSpinner("Loading snapshots…", id=f"spinner-{c.name}",
+                                         classes="status-bar"))
             except Exception:
                 pass
         # Load the currently active tab right away
