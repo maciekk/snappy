@@ -199,8 +199,28 @@ def get_snapshots(config_name: str) -> list[Snapshot]:
     except json.JSONDecodeError:
         log.error("Invalid JSON from snapper list (config '%s'): %s", config_name, result.stdout[:200])
         return []
+
+    # Snapper's JSON shape varies by version:
+    #   - older: {"snapshots": [...]}
+    #   - newer: direct list [...]
+    #   - some: {<config_name>: [...]}
+    if isinstance(data, list):
+        raw_list = data
+    elif isinstance(data, dict):
+        raw_list = (
+            data.get("snapshots")
+            or data.get(config_name)
+            or next((v for v in data.values() if isinstance(v, list)), None)
+            or []
+        )
+        log.debug("snapper list JSON keys for '%s': %s", config_name, list(data.keys()))
+    else:
+        log.error("Unexpected JSON type from snapper list (config '%s'): %s", config_name, type(data))
+        return []
+
+    log.debug("snapper list raw entry count for '%s': %d", config_name, len(raw_list))
     snapshots = []
-    for s in data.get("snapshots", []):
+    for s in raw_list:
         userdata = s.get("userdata", {})
         if isinstance(userdata, str):
             userdata = {}

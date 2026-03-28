@@ -383,6 +383,7 @@ class SnappyApp(App):
         self.configs: list[backend.SnapperConfig] = []
         self.snapshots: dict[str, list[backend.Snapshot]] = {}
         self.fs_usage: backend.FilesystemUsage | None = None
+        self._loaded_configs: set[str] = set()  # configs whose snapshots have been fetched
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -432,29 +433,22 @@ class SnappyApp(App):
 
     @work(thread=True)
     def _load_data(self) -> None:
+        """Fetch configs and filesystem usage only — snapshots are loaded lazily per tab."""
         configs = backend.get_configs()
         fs_usage = backend.get_filesystem_usage()
-        snapshots: dict[str, list[backend.Snapshot]] = {}
-        for cfg in configs:
-            try:
-                snapshots[cfg.name] = backend.get_snapshots(cfg.name)
-            except backend.SudoExpiredError:
-                log.warning("sudo expired while loading snapshots for '%s'", cfg.name)
-                self.app.call_from_thread(self._show_sudo_expired)
-                snapshots[cfg.name] = []
-        self.app.call_from_thread(self._populate, configs, snapshots, fs_usage)
+        self.app.call_from_thread(self._populate, configs, fs_usage)
 
     def _populate(
         self,
         configs: list[backend.SnapperConfig],
-        snapshots: dict[str, list[backend.Snapshot]],
         fs_usage: backend.FilesystemUsage | None,
     ) -> None:
         self.configs = configs
-        self.snapshots = snapshots
+        self.snapshots = {}
+        self._loaded_configs = set()
         self.fs_usage = fs_usage
 
-        # Hide loading indicator
+        # Hide global loading indicator
         try:
             self.query_one("#loading-container").remove()
         except Exception:
@@ -472,50 +466,92 @@ class SnappyApp(App):
         else:
             summary.update("Could not read filesystem usage (run as root?)")
 
-        # Build tabs for each config
+        # Build tabs — each starts with a spinner until its snapshots are loaded
         tabs = self.query_one("#config-tabs", TabbedContent)
         for cfg in configs:
             pane = TabPane(f"{cfg.name} ({cfg.subvolume})", id=f"tab-{cfg.name}")
             tabs.add_pane(pane)
 
-        # Populate tables after tabs are mounted — defer slightly
-        self.set_timer(0.1, self._populate_tables)
+        # Mount per-tab spinners after panes are added, then load the active tab
+        self.set_timer(0.1, self._init_tab_spinners)
 
-    def _populate_tables(self) -> None:
+    def _init_tab_spinners(self) -> None:
+        """Add a spinner to every tab pane, then kick off loading for the active tab."""
         for cfg in self.configs:
             try:
                 pane = self.query_one(f"#tab-{cfg.name}", TabPane)
+                pane.mount(BrailleSpinner(id=f"spinner-{cfg.name}"))
+                pane.mount(Static("Loading snapshots…", id=f"loading-label-{cfg.name}",
+                                  classes="status-bar"))
             except Exception:
+                pass
+        # Load only the active tab now
+        cfg = self._get_active_config()
+        if cfg:
+            self._load_tab_snapshots(cfg.name)
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        """Load a tab's snapshots the first time it is activated."""
+        if not event.tab:
+            return
+        config_name = event.tab.id.replace("tab-", "", 1) if event.tab.id else None
+        if config_name and config_name not in self._loaded_configs:
+            self._load_tab_snapshots(config_name)
+
+    @work(thread=True)
+    def _load_tab_snapshots(self, config_name: str) -> None:
+        log.info("Loading snapshots for config '%s'", config_name)
+        try:
+            snaps = backend.get_snapshots(config_name)
+        except backend.SudoExpiredError:
+            log.warning("sudo expired while loading snapshots for '%s'", config_name)
+            self.app.call_from_thread(self._show_sudo_expired)
+            snaps = []
+        except Exception:
+            log.exception("Unexpected error loading snapshots for '%s'", config_name)
+            snaps = []
+        self.app.call_from_thread(self._populate_tab, config_name, snaps)
+
+    def _populate_tab(self, config_name: str, snaps: list[backend.Snapshot]) -> None:
+        self._loaded_configs.add(config_name)
+        self.snapshots[config_name] = snaps
+
+        try:
+            pane = self.query_one(f"#tab-{config_name}", TabPane)
+        except Exception:
+            return
+
+        # Remove the placeholder spinner and label
+        for widget_id in (f"spinner-{config_name}", f"loading-label-{config_name}"):
+            try:
+                pane.query_one(f"#{widget_id}").remove()
+            except Exception:
+                pass
+
+        table = DataTable(id=f"table-{config_name}")
+        status = Static("", classes="status-bar", id=f"status-{config_name}")
+        pane.mount(table)
+        pane.mount(status)
+
+        table.cursor_type = "row"
+        table.add_columns("#", "Type", "Date", "Description", "Used Space", "Cleanup", "RO")
+
+        for snap in reversed(snaps):  # newest first
+            if snap.number == 0:
                 continue
+            table.add_row(
+                str(snap.number),
+                snap.type,
+                snap.date,
+                snap.description[:50],
+                snap.used_space or "-",
+                snap.cleanup,
+                "yes" if snap.read_only else "no",
+                key=str(snap.number),
+            )
 
-            table = DataTable(id=f"table-{cfg.name}")
-            status = Static("", classes="status-bar", id=f"status-{cfg.name}")
-            pane.mount(table)
-            pane.mount(status)
-
-            table.cursor_type = "row"
-            table.add_columns("#", "Type", "Date", "Description", "Used Space", "Cleanup", "RO")
-
-            snaps = self.snapshots.get(cfg.name, [])
-            for snap in reversed(snaps):  # newest first
-                if snap.number == 0:
-                    # Snapshot 0 is the current subvolume, skip
-                    continue
-                ro_str = "yes" if snap.read_only else "no"
-                table.add_row(
-                    str(snap.number),
-                    snap.type,
-                    snap.date,
-                    snap.description[:50],
-                    snap.used_space or "-",
-                    snap.cleanup,
-                    ro_str,
-                    key=str(snap.number),
-                )
-
-            count = len([s for s in snaps if s.number != 0])
-            status_widget = self.query_one(f"#status-{cfg.name}", Static)
-            status_widget.update(f"{count} snapshots")
+        count = len([s for s in snaps if s.number != 0])
+        self.query_one(f"#status-{config_name}", Static).update(f"{count} snapshots")
 
     def _show_sudo_expired(self) -> None:
         self._update_sudo_status()
@@ -547,16 +583,25 @@ class SnappyApp(App):
         return None
 
     def action_refresh(self) -> None:
-        # Clear and reload
-        tabs = self.query_one("#config-tabs", TabbedContent)
-        tabs.clear_panes()
-        loading = Vertical(
-            BrailleSpinner(id="loading-indicator"),
-            Static("Reading snapshots — this can take a while...", id="loading-text"),
-            id="loading-container",
-        )
-        self.mount(loading, before="#config-tabs")
-        self._load_data()
+        """Reload the active tab immediately; mark other tabs as unloaded (load on demand)."""
+        cfg = self._get_active_config()
+        if not cfg:
+            return
+        # Mark all configs as unloaded and clear snapshot data
+        self._loaded_configs = set()
+        self.snapshots = {}
+        # Rebuild each tab's placeholder spinner (drop existing table/status)
+        for c in self.configs:
+            try:
+                pane = self.query_one(f"#tab-{c.name}", TabPane)
+                pane.query("*").remove()
+                pane.mount(BrailleSpinner(id=f"spinner-{c.name}"))
+                pane.mount(Static("Loading snapshots…", id=f"loading-label-{c.name}",
+                                  classes="status-bar"))
+            except Exception:
+                pass
+        # Load the currently active tab right away
+        self._load_tab_snapshots(cfg.name)
 
     def action_file_search(self) -> None:
         cfg = self._get_active_config()
