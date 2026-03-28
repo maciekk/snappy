@@ -16,7 +16,7 @@ from textual.screen import ModalScreen
 from textual.widget import Widget
 from textual.widgets import (
     DataTable,
-    DirectoryTree,
+    Tree,
     Footer,
     Header,
     Input,
@@ -205,37 +205,77 @@ class BrowseScreen(ModalScreen):
         self.snapshot_path = snapshot_path
         self.snapshot_label = snapshot_label
 
+    # Sentinel used as placeholder data to detect un-loaded directory nodes.
+    _LOADING = object()
+
     def compose(self) -> ComposeResult:
         with Vertical(id="browse-dialog"):
             yield Label(f"Browsing: [bold]{self.snapshot_label}[/bold]  ({self.snapshot_path})")
             with Horizontal(id="browse-layout"):
-                if self.snapshot_path.is_dir():
-                    yield DirectoryTree(str(self.snapshot_path), id="browse-tree")
-                else:
-                    yield Label(f"Path not accessible: {self.snapshot_path}", id="browse-tree")
+                yield Tree("Loading…", id="browse-tree")
                 with Vertical(id="browse-detail"):
                     yield Static("Select a file to see details", id="detail-info")
 
-    def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
-        self._show_file_detail(Path(event.path))
+    def on_mount(self) -> None:
+        self._load_dir_node(self.query_one("#browse-tree", Tree).root, self.snapshot_path)
 
-    def on_directory_tree_directory_selected(self, event: DirectoryTree.DirectorySelected) -> None:
-        self._show_file_detail(Path(event.path))
-
-    def _show_file_detail(self, path: Path) -> None:
-        detail = self.query_one("#detail-info", Static)
+    @work(thread=True)
+    def _load_dir_node(self, node, path: Path) -> None:
         try:
-            stat = path.stat(follow_symlinks=False)
-            lines = [
-                f"[bold]Name:[/bold] {path.name}",
-                f"[bold]Size:[/bold] {_fmt_size(stat.st_size)}",
-                f"[bold]Modified:[/bold] {_fmt_mtime(stat.st_mtime)}",
-                f"[bold]Permissions:[/bold] {oct(stat.st_mode)[-3:]}",
-                f"[bold]Type:[/bold] {'Directory' if path.is_dir() else 'File'}",
-            ]
-            detail.update("\n".join(lines))
-        except (PermissionError, OSError) as e:
-            detail.update(f"Cannot stat: {e}")
+            entries = backend.browse_directory(path)
+        except backend.SudoExpiredError:
+            self.app.call_from_thread(
+                lambda: node.set_label("sudo credentials expired")
+            )
+            return
+        except Exception as e:
+            self.app.call_from_thread(
+                lambda: node.set_label(f"Error: {e}")
+            )
+            return
+        self.app.call_from_thread(self._populate_node, node, path, entries)
+
+    def _populate_node(
+        self, node, path: Path, entries: list[backend.FileInfo]
+    ) -> None:
+        if node.is_root:
+            node.set_label(str(path))
+        for entry in entries:
+            if entry.is_dir:
+                child = node.add(entry.name, data=entry)
+                child.add("…", data=self._LOADING)
+            else:
+                node.add_leaf(entry.name, data=entry)
+        if node.is_root:
+            node.expand()
+
+    def on_tree_node_expanded(self, event: Tree.NodeExpanded) -> None:
+        node = event.node
+        if not isinstance(node.data, backend.FileInfo) or not node.data.is_dir:
+            return
+        children = list(node.children)
+        if len(children) == 1 and children[0].data is self._LOADING:
+            node.remove_children()
+            self._load_dir_node(node, Path(node.data.path))
+
+    def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
+        if isinstance(event.node.data, backend.FileInfo):
+            self._show_file_detail(event.node.data)
+
+    def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
+        if isinstance(event.node.data, backend.FileInfo):
+            self._show_file_detail(event.node.data)
+
+    def _show_file_detail(self, entry: backend.FileInfo) -> None:
+        detail = self.query_one("#detail-info", Static)
+        lines = [
+            f"[bold]Name:[/bold] {entry.name}",
+            f"[bold]Size:[/bold] {_fmt_size(entry.size)}",
+            f"[bold]Modified:[/bold] {_fmt_mtime(entry.mtime)}",
+            f"[bold]Permissions:[/bold] {entry.permissions}",
+            f"[bold]Type:[/bold] {'Directory' if entry.is_dir else 'File'}",
+        ]
+        detail.update("\n".join(lines))
 
 
 # ── Delete Confirmation Screen ───────────────────────────────────────────

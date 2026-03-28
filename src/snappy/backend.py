@@ -354,31 +354,33 @@ def get_snapshot_path(config: SnapperConfig, snapshot_number: int) -> Path:
 
 
 def browse_directory(path: str | Path) -> list[FileInfo]:
+    """List directory contents using privileged access (sudo if needed)."""
     path = Path(path)
+    result = _run_privileged([
+        "find", str(path), "-maxdepth", "1", "-mindepth", "1",
+        "-printf", r"%f\t%y\t%s\t%T@\t%m\n",
+    ])
     entries = []
-    try:
-        for entry in sorted(os.scandir(path), key=lambda e: (not e.is_dir(), e.name.lower())):
-            try:
-                stat = entry.stat(follow_symlinks=False)
-                entries.append(FileInfo(
-                    name=entry.name,
-                    path=str(Path(entry.path)),
-                    is_dir=entry.is_dir(follow_symlinks=False),
-                    size=stat.st_size if not entry.is_dir(follow_symlinks=False) else 0,
-                    mtime=stat.st_mtime,
-                    permissions=oct(stat.st_mode)[-3:],
-                ))
-            except (PermissionError, OSError):
-                entries.append(FileInfo(
-                    name=entry.name,
-                    path=str(Path(entry.path)),
-                    is_dir=entry.is_dir(follow_symlinks=False),
-                    size=0,
-                    mtime=0,
-                    permissions="???",
-                ))
-    except (PermissionError, OSError):
-        pass
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 5:
+            continue
+        name, type_char, size_str, mtime_str, perms = parts
+        try:
+            size = int(size_str)
+            mtime = float(mtime_str)
+        except ValueError:
+            size, mtime = 0, 0.0
+        is_dir = type_char == "d"
+        entries.append(FileInfo(
+            name=name,
+            path=str(path / name),
+            is_dir=is_dir,
+            size=size if not is_dir else 0,
+            mtime=mtime,
+            permissions=perms,
+        ))
+    entries.sort(key=lambda e: (not e.is_dir, e.name.lower()))
     return entries
 
 
