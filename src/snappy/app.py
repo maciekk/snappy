@@ -412,7 +412,9 @@ class BrowseScreen(ModalScreen):
                 name_style = "bold" if is_changed else "bold dim"
             else:
                 name_style = "" if is_changed else "dim"
-            label.append(marker, style="dark_orange dim")
+            # Files lack the expand/collapse triangle that folders have, so add 2 spaces for alignment
+            marker_prefix = "" if entry.is_dir else "  "
+            label.append(marker_prefix + marker, style="dark_orange dim")
             name = entry.name
             if len(name) > max_name_len:
                 name = name[:max_name_len - 1] + "…"
