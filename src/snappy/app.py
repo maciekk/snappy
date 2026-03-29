@@ -36,7 +36,28 @@ log = logging.getLogger(__name__)
 def _fmt_size(size_bytes: int) -> str:
     if size_bytes <= 0:
         return "-"
-    return humanize.naturalsize(size_bytes, binary=True)
+    s = humanize.naturalsize(size_bytes, binary=True)
+    return s.replace(" Bytes", " B").replace(" Byte", " B")
+
+
+def _fmt_size_styled(size_bytes: int) -> tuple[str, str]:
+    """Return (text, rich_style) for tree node size display.
+
+    Uses >5.1f for KiB+ so decimal points align within a level when rjust'd.
+    Color encodes magnitude: B=dim, KiB=normal, MiB=bold, GiB+=bold yellow.
+    """
+    if size_bytes <= 0:
+        return "-", "dim"
+    if size_bytes < 1024:
+        return f"{size_bytes:>5} B  ", "dim"  # pad to same width as ">5.1f KiB"
+    elif size_bytes < 1024 ** 2:
+        return f"{size_bytes / 1024:>5.1f} KiB", ""
+    elif size_bytes < 1024 ** 3:
+        return f"{size_bytes / 1024 ** 2:>5.1f} MiB", "bold"
+    elif size_bytes < 1024 ** 4:
+        return f"{size_bytes / 1024 ** 3:>5.1f} GiB", "bold yellow"
+    else:
+        return f"{size_bytes / 1024 ** 4:>5.1f} TiB", "bold yellow"
 
 
 def _fmt_mtime(ts: float) -> str:
@@ -343,10 +364,20 @@ class BrowseScreen(ModalScreen):
         max_name_len = max(len(entry.name) for _node, _size, entry in entries)
         active = (parent_path_str == self._active_level_path)
         bar_style = "dark_orange" if active else "dark_orange dim"
-        for node, size, entry in entries:
+        # Pre-compute styled sizes so we can rjust all to the same width,
+        # which aligns decimal points across siblings in the same unit.
+        styled_sizes = []
+        for _node, size, entry in entries:
+            if size > 0:
+                styled_sizes.append(_fmt_size_styled(size))
+            else:
+                styled_sizes.append(("…" if entry.is_dir else "-", "dim"))
+        max_sz_w = max(len(t) for t, _ in styled_sizes)
+
+        for i, (node, size, entry) in enumerate(entries):
             fraction = size / max_size if max_size > 0 else 0.0
             bar = _make_bar(fraction)
-            size_str = _fmt_size(size) if size > 0 else "…"
+            size_str, size_style = styled_sizes[i]
             if self._changed_paths is None:
                 # Status not yet loaded — no dimming
                 is_changed = True
@@ -364,7 +395,7 @@ class BrowseScreen(ModalScreen):
             label.append(entry.name.ljust(max_name_len), style=name_style)
             label.append("  ")
             label.append(bar, style=bar_style)
-            label.append(f" {size_str}", style="dim")
+            label.append(" " + size_str.rjust(max_sz_w), style=size_style)
             node.set_label(label)
 
     def _on_du_sudo_expired(self) -> None:
