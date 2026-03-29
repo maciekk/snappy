@@ -390,15 +390,16 @@ class BrowseScreen(ModalScreen):
             bar = _make_bar(fraction)
             size_str, size_style = styled_sizes[i]
             if entry.is_dir:
-                marker = " "
                 if self._file_statuses is None:
+                    marker = "?"
                     is_changed = True
                 else:
+                    marker = " "
                     is_changed = entry.path in self._dirty_dirs
             else:
                 if self._file_statuses is None:
-                    # Status not yet loaded — show as potentially changed
-                    marker, is_changed = " ", True
+                    # Status not yet loaded — show as checking
+                    marker, is_changed = "?", True
                 else:
                     status_char = self._file_statuses.get(entry.path)
                     if status_char == "-":
