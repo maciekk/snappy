@@ -706,6 +706,7 @@ class SnappyApp(App):
         self.fs_usage: backend.FilesystemUsage | None = None
         self._loaded_configs: set[str] = set()  # configs whose snapshots have been fetched
         self._desc_column_keys: dict[str, object] = {}  # config_name -> description ColumnKey
+        self._pane_to_config: dict[str, str] = {}  # pane_id -> config_name (for tracking tabs)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -792,8 +793,11 @@ class SnappyApp(App):
         # Build tabs — each starts with a spinner until its snapshots are loaded
         tabs = self.query_one("#config-tabs", TabbedContent)
         for cfg in configs:
-            pane = TabPane(f"{cfg.name} ({cfg.subvolume})", id=f"tab-{cfg.name}")
+            pane_id = f"tab-{cfg.name}"
+            pane = TabPane(f"{cfg.name} ({cfg.subvolume})", id=pane_id)
             tabs.add_pane(pane)
+            # Track the mapping from pane ID to config name
+            self._pane_to_config[pane_id] = cfg.name
 
         # Mount per-tab spinners after panes are added, then load the active tab
         self.set_timer(0.1, self._init_tab_spinners)
@@ -814,9 +818,21 @@ class SnappyApp(App):
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         """Load a tab's snapshots the first time it is activated."""
-        if not event.tab:
+        if not event.tab or not event.tab.id:
             return
-        config_name = event.tab.id.replace("tab-", "", 1) if event.tab.id else None
+
+        # Try to find config using the pane mapping first
+        if event.tab.id in self._pane_to_config:
+            config_name = self._pane_to_config[event.tab.id]
+        else:
+            # Fallback: try to extract from tab ID (handles malformed IDs like "--content-tab-root")
+            config_name = event.tab.id
+            if "tab-" in config_name:
+                config_name = config_name.split("tab-", 1)[1]
+            # Remove any "--content" prefix that Textual might have added
+            if config_name.startswith("--content-"):
+                config_name = config_name[len("--content-"):]
+
         if config_name and config_name not in self._loaded_configs:
             self._load_tab_snapshots(config_name)
 
@@ -919,8 +935,20 @@ class SnappyApp(App):
         active_id = tabs.active
         if not active_id:
             return self.configs[0] if self.configs else None
-        # active_id is like "tab-root"
-        config_name = active_id.replace("tab-", "")
+
+        # Try to find config using the pane mapping first
+        if active_id in self._pane_to_config:
+            config_name = self._pane_to_config[active_id]
+        else:
+            # Fallback: try to extract from active_id (handles malformed IDs like "--content-tab-root")
+            # Remove any prefix patterns and extract just the config name
+            config_name = active_id
+            if "tab-" in config_name:
+                config_name = config_name.split("tab-", 1)[1]
+            # Remove any "--content" prefix that Textual might have added
+            if config_name.startswith("--content-"):
+                config_name = config_name[len("--content-"):]
+
         for cfg in self.configs:
             if cfg.name == config_name:
                 return cfg
