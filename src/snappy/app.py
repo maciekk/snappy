@@ -839,18 +839,20 @@ class SnappyApp(App):
     @work(thread=True)
     def _load_tab_snapshots(self, config_name: str) -> None:
         log.info("Loading snapshots for config '%s'", config_name)
+        snaps = []
+        error_msg = None
         try:
             snaps = backend.get_snapshots(config_name)
         except backend.SudoExpiredError:
             log.warning("sudo expired while loading snapshots for '%s'", config_name)
             self.app.call_from_thread(self._show_sudo_expired)
-            snaps = []
-        except Exception:
+            error_msg = "sudo credentials expired"
+        except Exception as e:
             log.exception("Unexpected error loading snapshots for '%s'", config_name)
-            snaps = []
-        self.app.call_from_thread(self._populate_tab, config_name, snaps)
+            error_msg = f"Failed to load snapshots: {type(e).__name__}"
+        self.app.call_from_thread(self._populate_tab, config_name, snaps, error_msg)
 
-    def _populate_tab(self, config_name: str, snaps: list[backend.Snapshot]) -> None:
+    def _populate_tab(self, config_name: str, snaps: list[backend.Snapshot], error_msg: str | None = None) -> None:
         self._loaded_configs.add(config_name)
 
         try:
@@ -864,6 +866,12 @@ class SnappyApp(App):
                 pane.query_one(f"#{widget_id}").remove()
             except Exception:
                 pass
+
+        # If there was an error loading snapshots, display the error message
+        if error_msg:
+            error_widget = Static(f"[red]✗ {error_msg}[/red]", classes="status-bar")
+            pane.mount(error_widget)
+            return
 
         table = DataTable(id=f"table-{config_name}")
         status = Static("", classes="status-bar", id=f"status-{config_name}")
