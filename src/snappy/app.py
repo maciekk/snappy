@@ -1075,21 +1075,47 @@ class SnappyApp(App):
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         # Only act on the main snapshot tables, not the file-search results table
-        if event.data_table.id and event.data_table.id.startswith("table-"):
-            self.action_browse()
+        if not event.data_table.id or not event.data_table.id.startswith("table-"):
+            return
+
+        # Extract config name from the table ID (e.g., "table-root" -> "root")
+        config_name = event.data_table.id[len("table-"):]
+        snap_num = self._get_selected_snapshot_number_for_config(config_name, event.data_table)
+
+        if snap_num:
+            cfg = next((c for c in self.configs if c.name == config_name), None)
+            if cfg:
+                self._browse_snapshot(cfg, snap_num)
+                return
+
+        log.warning("on_data_table_row_selected: could not browse snapshot from table %s", event.data_table.id)
+
+    def _get_selected_snapshot_number_for_config(self, config_name: str, table: DataTable) -> int | None:
+        """Get the selected snapshot number from a specific table."""
+        if table.cursor_row is not None and table.row_count > 0:
+            row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
+            snap_num = int(row_key.value)
+            log.debug("_get_selected_snapshot_number_for_config: config=%s, snap_num=%s", config_name, snap_num)
+            return snap_num
+        log.warning("_get_selected_snapshot_number_for_config: cursor_row=%s, row_count=%s for config %s", table.cursor_row, table.row_count, config_name)
+        return None
+
+    def _browse_snapshot(self, cfg: backend.SnapperConfig, snap_num: int) -> None:
+        """Open the browse screen for a given config and snapshot."""
+        snap_path = backend.get_snapshot_path(cfg, snap_num)
+        snaps = backend.get_snapshots(cfg.name)
+        snap = next((s for s in snaps if s.number == snap_num), None)
+        size_str = _fmt_size(int(snap.used_space)) if snap and snap.used_space else ""
+        label = f"Config: {cfg.name}  Snapshot: #{snap_num}"
+        if size_str:
+            label += f"  ({size_str})"
+        self.push_screen(BrowseScreen(snap_path, label, cfg.name, snap_num))
 
     def action_browse(self) -> None:
         cfg = self._get_active_config()
         snap_num = self._get_selected_snapshot_number()
         if cfg and snap_num:
-            snap_path = backend.get_snapshot_path(cfg, snap_num)
-            snaps = backend.get_snapshots(cfg.name)
-            snap = next((s for s in snaps if s.number == snap_num), None)
-            size_str = _fmt_size(int(snap.used_space)) if snap and snap.used_space else ""
-            label = f"Config: {cfg.name}  Snapshot: #{snap_num}"
-            if size_str:
-                label += f"  ({size_str})"
-            self.push_screen(BrowseScreen(snap_path, label, cfg.name, snap_num))
+            self._browse_snapshot(cfg, snap_num)
 
     def action_delete_snapshot(self) -> None:
         cfg = self._get_active_config()
