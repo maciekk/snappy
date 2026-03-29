@@ -436,11 +436,38 @@ class BrowseScreen(ModalScreen):
         except Exception as e:
             log.warning("snapper status failed: %s", e)
             return
-        # Convert relative paths (e.g. "/etc/fstab") to absolute snapshot paths
-        statuses = {
-            str(self.snapshot_path / p.lstrip("/")): s
-            for p, s in rel_statuses.items()
-        }
+        # Convert relative paths (e.g. "/etc/fstab") to absolute snapshot paths.
+        # Snapper may return paths relative to subvolume root (e.g. "/maciek/...") or
+        # absolute paths including the subvolume (e.g. "/home/maciek/...").
+        # Deduce the subvolume from snapshot_path and handle both cases.
+        statuses = {}
+        snapshot_parts = self.snapshot_path.parts
+        try:
+            snapshots_idx = snapshot_parts.index(".snapshots")
+            if snapshots_idx > 0:
+                subvolume = Path(*snapshot_parts[:snapshots_idx])
+                for p, s in rel_statuses.items():
+                    path_obj = Path(p)
+                    # If path starts with subvolume, strip it
+                    try:
+                        relative_p = path_obj.relative_to(subvolume)
+                        full_path = self.snapshot_path / str(relative_p).lstrip("/")
+                    except ValueError:
+                        # Path doesn't include subvolume prefix, use as-is
+                        full_path = self.snapshot_path / p.lstrip("/")
+                    statuses[str(full_path)] = s
+            else:
+                # Fallback to original logic if snapshot structure is unexpected
+                statuses = {
+                    str(self.snapshot_path / p.lstrip("/")): s
+                    for p, s in rel_statuses.items()
+                }
+        except (ValueError, IndexError):
+            # Fallback to original logic
+            statuses = {
+                str(self.snapshot_path / p.lstrip("/")): s
+                for p, s in rel_statuses.items()
+            }
         self.app.call_from_thread(self._on_status_ready, statuses)
 
     def _on_status_ready(self, statuses: dict[str, str]) -> None:
