@@ -38,6 +38,31 @@ TUI is running. Therefore:
 - The app shows a countdown timer and a popup when credentials expire, telling
   the user to run `sudo -v` in another terminal.
 
+## Browse snapshot status
+
+`snapper status <snap>..0` compares a snapshot against the live filesystem and
+outputs **only the changed files** — one line per changed path. Unchanged files
+produce no output at all.
+
+This has two important consequences:
+
+- We cannot tell whether a file is unchanged until the command finishes. A file
+  absent from the output halfway through the run may still appear later.
+- Streaming the output line-by-line and resolving markers incrementally is
+  therefore only useful for *changed* files. The majority of entries (unchanged
+  ones) can only be resolved when the command exits.
+
+For large snapshots with many changed files (e.g. a game installation), this
+command can take several minutes. The chosen UX is to show a spinner while it
+runs and apply all markers at once when it completes.
+
+### Background thread → UI updates
+
+`call_from_thread` has non-trivial overhead. Never call it once per entry when
+processing thousands of results — batch entries in the worker thread and send
+them in a single callback, or accept all-at-once delivery. Calling it in a
+tight loop for every snapper output line caused severe UI slowdown.
+
 ## Logging
 
 A debug log is written to `~/.local/state/snappy/snappy.log` (respects

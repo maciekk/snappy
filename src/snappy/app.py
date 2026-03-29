@@ -230,6 +230,15 @@ class BrowseScreen(ModalScreen):
         background: $surface;
         padding: 0 2 1 2;
     }
+    #browse-header {
+        height: 1;
+        layout: horizontal;
+    }
+    #browse-status-spinner {
+        width: auto;
+        margin-left: 2;
+        display: none;
+    }
     #browse-tree {
         height: 1fr;
     }
@@ -271,13 +280,16 @@ class BrowseScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="browse-dialog"):
-            yield Label(f"Browsing: [bold]{self.snapshot_label}[/bold]")
+            with Horizontal(id="browse-header"):
+                yield Label(f"Browsing: [bold]{self.snapshot_label}[/bold]")
+                yield BrailleSpinner("checking status…", id="browse-status-spinner")
             yield Tree("Loading…", id="browse-tree")
             yield Static("", id="browse-detail")
 
     def on_mount(self) -> None:
         self._load_dir_node(self.query_one("#browse-tree", Tree).root, self.snapshot_path)
         if self._config_name and self._snap_num is not None:
+            self.query_one("#browse-status-spinner", BrailleSpinner).styles.display = "block"
             self._fetch_snapshot_status(self._config_name, self._snap_num)
 
     @work(thread=True)
@@ -390,16 +402,11 @@ class BrowseScreen(ModalScreen):
             bar = _make_bar(fraction)
             size_str, size_style = styled_sizes[i]
             if entry.is_dir:
-                if self._file_statuses is None:
-                    marker = "?"
-                    is_changed = True
-                else:
-                    marker = " "
-                    is_changed = entry.path in self._dirty_dirs
+                marker = " "
+                is_changed = entry.path in self._dirty_dirs
             else:
                 if self._file_statuses is None:
-                    # Status not yet loaded — show as checking
-                    marker, is_changed = "?", True
+                    marker, is_changed = " ", False
                 else:
                     status_char = self._file_statuses.get(entry.path)
                     if status_char == "-":
@@ -430,6 +437,24 @@ class BrowseScreen(ModalScreen):
             self._sudo_expired_du_shown = True
             self.app.push_screen(SudoExpiredScreen())
 
+    def _resolve_status_path(self, rel_path: str) -> str:
+        """Convert a snapper status path (relative to subvolume) to absolute snapshot path."""
+        snapshot_parts = self.snapshot_path.parts
+        try:
+            snapshots_idx = snapshot_parts.index(".snapshots")
+            if snapshots_idx > 0:
+                subvolume = Path(*snapshot_parts[:snapshots_idx])
+                path_obj = Path(rel_path)
+                try:
+                    relative_p = path_obj.relative_to(subvolume)
+                    return str(self.snapshot_path / str(relative_p).lstrip("/"))
+                except ValueError:
+                    return str(self.snapshot_path / rel_path.lstrip("/"))
+            else:
+                return str(self.snapshot_path / rel_path.lstrip("/"))
+        except (ValueError, IndexError):
+            return str(self.snapshot_path / rel_path.lstrip("/"))
+
     @work(thread=True)
     def _fetch_snapshot_status(self, config_name: str, snap_num: int) -> None:
         try:
@@ -439,43 +464,14 @@ class BrowseScreen(ModalScreen):
         except Exception as e:
             log.warning("snapper status failed: %s", e)
             return
-        # Convert relative paths (e.g. "/etc/fstab") to absolute snapshot paths.
-        # Snapper may return paths relative to subvolume root (e.g. "/maciek/...") or
-        # absolute paths including the subvolume (e.g. "/home/maciek/...").
-        # Deduce the subvolume from snapshot_path and handle both cases.
-        statuses = {}
-        snapshot_parts = self.snapshot_path.parts
-        try:
-            snapshots_idx = snapshot_parts.index(".snapshots")
-            if snapshots_idx > 0:
-                subvolume = Path(*snapshot_parts[:snapshots_idx])
-                for p, s in rel_statuses.items():
-                    path_obj = Path(p)
-                    # If path starts with subvolume, strip it
-                    try:
-                        relative_p = path_obj.relative_to(subvolume)
-                        full_path = self.snapshot_path / str(relative_p).lstrip("/")
-                    except ValueError:
-                        # Path doesn't include subvolume prefix, use as-is
-                        full_path = self.snapshot_path / p.lstrip("/")
-                    statuses[str(full_path)] = s
-            else:
-                # Fallback to original logic if snapshot structure is unexpected
-                statuses = {
-                    str(self.snapshot_path / p.lstrip("/")): s
-                    for p, s in rel_statuses.items()
-                }
-        except (ValueError, IndexError):
-            # Fallback to original logic
-            statuses = {
-                str(self.snapshot_path / p.lstrip("/")): s
-                for p, s in rel_statuses.items()
-            }
+        statuses = {
+            self._resolve_status_path(p): s for p, s in rel_statuses.items()
+        }
         self.app.call_from_thread(self._on_status_ready, statuses)
 
     def _on_status_ready(self, statuses: dict[str, str]) -> None:
+        """Apply all status results and finalize."""
         self._file_statuses = statuses
-        # Precompute all ancestor dirs of changed/deleted paths for O(1) directory lookup
         dirty: set[str] = set()
         for p in statuses:
             parent = Path(p).parent
@@ -485,6 +481,10 @@ class BrowseScreen(ModalScreen):
                     break
                 parent = parent.parent
         self._dirty_dirs = dirty
+        self._on_status_stream_complete()
+
+    def _on_status_stream_complete(self) -> None:
+        self.query_one("#browse-status-spinner", BrailleSpinner).styles.display = "none"
         self._redraw_all_levels()
 
     def action_toggle_sort(self) -> None:
