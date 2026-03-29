@@ -147,8 +147,9 @@ class FileSearchScreen(ModalScreen):
         height: 1fr;
     }
     #search-hint {
-        color: $text-muted;
+        color: $text-disabled;
         margin-bottom: 1;
+        height: auto;
     }
     #search-loading {
         height: 1;
@@ -164,8 +165,8 @@ class FileSearchScreen(ModalScreen):
         with Vertical(id="search-dialog"):
             yield Label(f"File Search — config: [bold]{self.config.name}[/bold] ({self.config.subvolume})")
             yield Label(
-                "Enter a substring to search for across all snapshots (matches any part of the path)."
-                " Glob wildcards supported: * matches anything, ? matches one character.",
+                "Matches any part of the path across all snapshots."
+                "\nWildcards: [$accent]*[/] any string  [$accent]?[/] one character",
                 id="search-hint",
             )
             yield Input(placeholder="search term (e.g. fstab, home/user, .conf)", id="search-input")
