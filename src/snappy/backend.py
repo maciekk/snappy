@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -177,18 +178,42 @@ class SudoExpiredError(Exception):
     """Raised when a privileged command cannot run because sudo has expired."""
 
 
+_running_procs: list[subprocess.Popen[str]] = []
+_running_procs_lock = threading.Lock()
+
+
+def kill_running_subprocesses() -> None:
+    """Kill all subprocesses currently running in background workers."""
+    with _running_procs_lock:
+        for proc in _running_procs:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
 def _run(cmd: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
     log.debug("Running: %s", cmd)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    with _running_procs_lock:
+        _running_procs.append(proc)
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        log.warning("Command timed out after %ds: %s", timeout, cmd)
-        return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="Command timed out")
-    if result.returncode != 0:
-        log.warning("Command failed (rc=%d): %s\nstderr: %s", result.returncode, cmd, result.stderr.strip())
-    else:
-        log.debug("Command succeeded: %s (stdout %d bytes)", cmd, len(result.stdout))
-    return result
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            log.warning("Command timed out after %ds: %s", timeout, cmd)
+            return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="Command timed out")
+        result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+        if result.returncode != 0:
+            log.warning("Command failed (rc=%d): %s\nstderr: %s", result.returncode, cmd, result.stderr.strip())
+        else:
+            log.debug("Command succeeded: %s (stdout %d bytes)", cmd, len(result.stdout))
+        return result
+    finally:
+        with _running_procs_lock:
+            _running_procs.remove(proc)
 
 
 def _run_privileged(cmd: list[str], timeout: int = 120) -> subprocess.CompletedProcess:

@@ -757,6 +757,10 @@ class SnappyApp(App):
         yield TabbedContent(id="config-tabs")
         yield Footer()
 
+    def action_quit(self) -> None:
+        backend.kill_running_subprocesses()
+        self.exit()
+
     def on_mount(self) -> None:
         self._load_data()
         if not backend.is_root():
