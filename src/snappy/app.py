@@ -237,6 +237,8 @@ class BrowseScreen(ModalScreen):
         self._active_level_path: str | None = None
         # Absolute snapshot paths that differ from current filesystem; None = not yet loaded
         self._changed_paths: set[str] | None = None
+        # All ancestor directories of changed paths (precomputed for O(1) dir lookup)
+        self._dirty_dirs: set[str] = set()
 
     # Sentinel used as placeholder data to detect un-loaded directory nodes.
     _LOADING = object()
@@ -347,14 +349,18 @@ class BrowseScreen(ModalScreen):
             size_str = _fmt_size(size) if size > 0 else "…"
             if self._changed_paths is None:
                 # Status not yet loaded — no dimming
-                changed = True
+                is_changed = True
+            elif entry.is_dir:
+                is_changed = entry.path in self._dirty_dirs
             else:
-                changed = entry.path in self._changed_paths
+                is_changed = entry.path in self._changed_paths
             label = Text()
+            marker = "+" if (is_changed and not entry.is_dir) else " "
             if entry.is_dir:
-                name_style = "bold"
+                name_style = "bold" if is_changed else "bold dim"
             else:
-                name_style = "" if changed else "dim"
+                name_style = "" if is_changed else "dim"
+            label.append(marker, style="dark_orange dim")
             label.append(entry.name.ljust(max_name_len), style=name_style)
             label.append("  ")
             label.append(bar, style=bar_style)
@@ -381,6 +387,16 @@ class BrowseScreen(ModalScreen):
 
     def _on_status_ready(self, changed: set[str]) -> None:
         self._changed_paths = changed
+        # Precompute all ancestor dirs of changed paths for O(1) directory lookup
+        dirty: set[str] = set()
+        for p in changed:
+            parent = Path(p).parent
+            while str(parent) not in dirty:
+                dirty.add(str(parent))
+                if parent == parent.parent:
+                    break
+                parent = parent.parent
+        self._dirty_dirs = dirty
         self._redraw_all_levels()
 
     def on_tree_node_expanded(self, event: Tree.NodeExpanded) -> None:
@@ -427,11 +443,6 @@ class BrowseScreen(ModalScreen):
                 size = cached
 
         parent_path_str = str(Path(entry.path).parent)
-        level_map = self._level_sizes.get(parent_path_str, {})
-        max_size = max((s for _n, s in level_map.values()), default=0)
-        fraction = size / max_size if max_size > 0 and size > 0 else 0.0
-        bar = _make_bar(fraction, width=12)
-
         size_display = _fmt_size(size) if size > 0 else ("…" if entry.is_dir else "-")
         kind = "Directory" if entry.is_dir else "File"
 
@@ -444,12 +455,25 @@ class BrowseScreen(ModalScreen):
         line1 = (
             col("name", entry.name[:20], C1) + SEP +
             col("type", kind, C2) + SEP +
-            f"[bold dim]size:[/bold dim] {size_display}  "
-            f"[dark_orange]{bar}[/dark_orange] [dim]{int(fraction * 100)}%[/dim]"
+            f"[bold dim]size:[/bold dim] {size_display}"
         )
+        if self._changed_paths is None:
+            status_text = "[dim]checking…[/dim]"
+        elif entry.is_dir:
+            if entry.path in self._dirty_dirs:
+                status_text = "[yellow]has changes[/yellow]"
+            else:
+                status_text = "[dim]all same as disk[/dim]"
+        else:
+            if entry.path in self._changed_paths:
+                status_text = "[yellow]stored in snapshot[/yellow]"
+            else:
+                status_text = "[dim]same as disk[/dim]"
+
         line2 = (
             col("modified", _fmt_mtime(entry.mtime), C1) + SEP +
-            col("perms", entry.permissions, C2) + SEP
+            col("perms", entry.permissions, C2) + SEP +
+            f"[bold dim]status:[/bold dim] {status_text}"
         )
         detail.update(f"{line1}\n{line2}")
 
