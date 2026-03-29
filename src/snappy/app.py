@@ -216,6 +216,7 @@ class BrowseScreen(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "dismiss", "Back"),
+        Binding("s", "toggle_sort", "Sort"),
     ]
 
     CSS = """
@@ -253,13 +254,17 @@ class BrowseScreen(ModalScreen):
         self._snap_num = snap_num
         # Maps parent_path_str -> {child_path_str -> (tree_node, size_bytes)}
         self._level_sizes: dict[str, dict[str, tuple]] = {}
+        # Maps parent_path_str -> parent TreeNode (for sorting)
+        self._level_nodes: dict[str, object] = {}
         self._sudo_expired_du_shown: bool = False
         # Path of the deepest expanded directory; its children show bright bars
         self._active_level_path: str | None = None
-        # Absolute snapshot paths that differ from current filesystem; None = not yet loaded
-        self._changed_paths: set[str] | None = None
-        # All ancestor directories of changed paths (precomputed for O(1) dir lookup)
+        # Maps absolute snapshot path -> snapper status char ('-', 'c', etc.); None = not yet loaded
+        self._file_statuses: dict[str, str] | None = None
+        # All ancestor directories of paths with any status entry (for O(1) dir lookup)
         self._dirty_dirs: set[str] = set()
+        # Sort order: False = alphabetical (dirs first), True = descending size
+        self._sort_by_size: bool = False
 
     # Sentinel used as placeholder data to detect un-loaded directory nodes.
     _LOADING = object()
@@ -310,8 +315,11 @@ class BrowseScreen(ModalScreen):
                 level_map[entry.path] = (leaf, entry.size)
 
         self._level_sizes[path_str] = level_map
+        self._level_nodes[path_str] = node
         if self._active_level_path is None:
             self._active_level_path = path_str
+        if self._sort_by_size:
+            self._sort_level(path_str)
         self._redraw_level_bars(path_str)
 
         for entry in entries:
@@ -379,15 +387,25 @@ class BrowseScreen(ModalScreen):
             fraction = size / max_size if max_size > 0 else 0.0
             bar = _make_bar(fraction)
             size_str, size_style = styled_sizes[i]
-            if self._changed_paths is None:
-                # Status not yet loaded — no dimming
-                is_changed = True
-            elif entry.is_dir:
-                is_changed = entry.path in self._dirty_dirs
+            if entry.is_dir:
+                marker = " "
+                if self._file_statuses is None:
+                    is_changed = True
+                else:
+                    is_changed = entry.path in self._dirty_dirs
             else:
-                is_changed = entry.path in self._changed_paths
+                if self._file_statuses is None:
+                    # Status not yet loaded — show as potentially changed
+                    marker, is_changed = " ", True
+                else:
+                    status_char = self._file_statuses.get(entry.path)
+                    if status_char == "-":
+                        marker, is_changed = "+", True   # in snapshot, not on disk
+                    elif status_char is not None:
+                        marker, is_changed = "~", True   # exists on disk but differs
+                    else:
+                        marker, is_changed = " ", False  # same as disk
             label = Text()
-            marker = "+" if (is_changed and not entry.is_dir) else " "
             if entry.is_dir:
                 name_style = "bold" if is_changed else "bold dim"
             else:
@@ -410,21 +428,24 @@ class BrowseScreen(ModalScreen):
     @work(thread=True)
     def _fetch_snapshot_status(self, config_name: str, snap_num: int) -> None:
         try:
-            rel_paths = backend.get_snapshot_status(config_name, snap_num)
+            rel_statuses = backend.get_snapshot_status(config_name, snap_num)
         except backend.SudoExpiredError:
             return
         except Exception as e:
             log.warning("snapper status failed: %s", e)
             return
         # Convert relative paths (e.g. "/etc/fstab") to absolute snapshot paths
-        changed = {str(self.snapshot_path / p.lstrip("/")) for p in rel_paths}
-        self.app.call_from_thread(self._on_status_ready, changed)
+        statuses = {
+            str(self.snapshot_path / p.lstrip("/")): s
+            for p, s in rel_statuses.items()
+        }
+        self.app.call_from_thread(self._on_status_ready, statuses)
 
-    def _on_status_ready(self, changed: set[str]) -> None:
-        self._changed_paths = changed
-        # Precompute all ancestor dirs of changed paths for O(1) directory lookup
+    def _on_status_ready(self, statuses: dict[str, str]) -> None:
+        self._file_statuses = statuses
+        # Precompute all ancestor dirs of changed/deleted paths for O(1) directory lookup
         dirty: set[str] = set()
-        for p in changed:
+        for p in statuses:
             parent = Path(p).parent
             while str(parent) not in dirty:
                 dirty.add(str(parent))
@@ -433,6 +454,28 @@ class BrowseScreen(ModalScreen):
                 parent = parent.parent
         self._dirty_dirs = dirty
         self._redraw_all_levels()
+
+    def action_toggle_sort(self) -> None:
+        self._sort_by_size = not self._sort_by_size
+        for path_str in list(self._level_nodes):
+            self._sort_level(path_str)
+
+    def _sort_level(self, path_str: str) -> None:
+        parent_node = self._level_nodes.get(path_str)
+        if parent_node is None:
+            return
+        level_map = self._level_sizes.get(path_str, {})
+        if self._sort_by_size:
+            parent_node._children.sort(
+                key=lambda n: -(level_map.get(getattr(n.data, "path", ""), (None, 0))[1]
+                                if isinstance(n.data, backend.FileInfo) else 0)
+            )
+        else:
+            parent_node._children.sort(
+                key=lambda n: (not n.data.is_dir, n.data.name.lower())
+                if isinstance(n.data, backend.FileInfo) else (True, "")
+            )
+        self.query_one("#browse-tree", Tree).refresh()
 
     def on_tree_node_expanded(self, event: Tree.NodeExpanded) -> None:
         node = event.node
@@ -492,7 +535,7 @@ class BrowseScreen(ModalScreen):
             col("type", kind, C2) + SEP +
             f"[bold dim]size:[/bold dim] {size_display}"
         )
-        if self._changed_paths is None:
+        if self._file_statuses is None:
             status_text = "[dim]checking…[/dim]"
         elif entry.is_dir:
             if entry.path in self._dirty_dirs:
@@ -500,8 +543,11 @@ class BrowseScreen(ModalScreen):
             else:
                 status_text = "[dim]all same as disk[/dim]"
         else:
-            if entry.path in self._changed_paths:
-                status_text = "[yellow]stored in snapshot[/yellow]"
+            status_char = self._file_statuses.get(entry.path)
+            if status_char == "-":
+                status_text = "[yellow]only in snapshot[/yellow]"
+            elif status_char is not None:
+                status_text = "[yellow]differs from disk[/yellow]"
             else:
                 status_text = "[dim]same as disk[/dim]"
 

@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 _snapshot_cache: dict[str, list] = {}          # config_name -> list[Snapshot]
 _config_detail_cache: dict[str, dict] = {}     # config_name -> dict[str, str]
 _dir_size_cache: dict[str, int] = {}           # abs path -> total bytes (from du -sb)
-_status_cache: dict[tuple, set[str]] = {}      # (config_name, snap_num) -> set of rel paths
+_status_cache: dict[tuple, dict[str, str]] = {}  # (config_name, snap_num) -> {rel_path -> status_char}
 
 
 def invalidate_cache(config_name: str | None = None) -> None:
@@ -418,8 +418,16 @@ def get_cached_dir_size(path: str | Path) -> int | None:
     return _dir_size_cache.get(str(Path(path).resolve()))
 
 
-def get_snapshot_status(config_name: str, snap_num: int) -> set[str]:
-    """Return paths (relative to subvolume root) that differ between snap_num and current.
+def get_snapshot_status(config_name: str, snap_num: int) -> dict[str, str]:
+    """Return a mapping of paths that differ between snap_num and the current filesystem.
+
+    Keys are paths relative to the subvolume root (e.g. '/etc/fstab').
+    Values are the first character of snapper's status code:
+      '-'  file is in the snapshot but was deleted from the current filesystem
+      'c'  content changed (file exists in both but differs)
+      '+'  file was added to the current filesystem after the snapshot (won't
+           appear in the snapshot tree, included for completeness)
+      other letters indicate permission/owner/type changes
 
     Runs: snapper -c <config_name> status <snap_num>..0
     Output lines look like: 'c..... /etc/fstab'
@@ -431,15 +439,16 @@ def get_snapshot_status(config_name: str, snap_num: int) -> set[str]:
         log.debug("Cache hit: status for %s #%d", config_name, snap_num)
         return _status_cache[key]
     result = _run_privileged(["snapper", "-c", config_name, "status", f"{snap_num}..0"])
-    changed: set[str] = set()
+    statuses: dict[str, str] = {}
     for line in result.stdout.splitlines():
         # Format: 6 status chars, space, absolute path from subvolume root
         parts = line.split(None, 1)
         if len(parts) == 2:
-            changed.add(parts[1])
-    log.debug("Status for %s #%d: %d changed paths", config_name, snap_num, len(changed))
-    _status_cache[key] = changed
-    return changed
+            status_code, path = parts
+            statuses[path] = status_code[0] if status_code else "?"
+    log.debug("Status for %s #%d: %d changed paths", config_name, snap_num, len(statuses))
+    _status_cache[key] = statuses
+    return statuses
 
 
 def find_file_in_snapshots(
