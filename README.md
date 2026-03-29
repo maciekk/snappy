@@ -5,6 +5,7 @@ A terminal UI for browsing and managing [snapper](http://snapper.io/) Btrfs snap
 ![Snapshots](screenshot-snapshots.png)
 ![Size sorting](screenshot-size-sorting.png)
 ![Browse markers](screenshot-markers.png)
+![File search](screenshot-file-search.png)
 
 ## Requirements
 
