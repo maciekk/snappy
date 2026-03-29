@@ -361,7 +361,8 @@ class BrowseScreen(ModalScreen):
         if not entries:
             return
         max_size = max((size for _node, size, _entry in entries), default=0)
-        max_name_len = max(len(entry.name) for _node, _size, entry in entries)
+        _NAME_CAP = 40
+        max_name_len = min(max(len(entry.name) for _node, _size, entry in entries), _NAME_CAP)
         active = (parent_path_str == self._active_level_path)
         bar_style = "dark_orange" if active else "dark_orange dim"
         # Pre-compute styled sizes so we can rjust all to the same width,
@@ -392,7 +393,10 @@ class BrowseScreen(ModalScreen):
             else:
                 name_style = "" if is_changed else "dim"
             label.append(marker, style="dark_orange dim")
-            label.append(entry.name.ljust(max_name_len), style=name_style)
+            name = entry.name
+            if len(name) > max_name_len:
+                name = name[:max_name_len - 1] + "…"
+            label.append(name.ljust(max_name_len), style=name_style)
             label.append("  ")
             label.append(bar, style=bar_style)
             label.append(" " + size_str.rjust(max_sz_w), style=size_style)
