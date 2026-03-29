@@ -44,7 +44,7 @@ def _fmt_size_styled(size_bytes: int) -> tuple[str, str]:
     """Return (text, rich_style) for tree node size display.
 
     Uses >5.1f for KiB+ so decimal points align within a level when rjust'd.
-    Color encodes magnitude: B=dim, KiB=normal, MiB=bold, GiB+=bold yellow.
+    Color encodes magnitude: B=dim, KiB=normal, MiB=dim orange3, GiB+=bold orange1.
     """
     if size_bytes <= 0:
         return "-", "dim"
@@ -53,11 +53,11 @@ def _fmt_size_styled(size_bytes: int) -> tuple[str, str]:
     elif size_bytes < 1024 ** 2:
         return f"{size_bytes / 1024:>5.1f} KiB", ""
     elif size_bytes < 1024 ** 3:
-        return f"{size_bytes / 1024 ** 2:>5.1f} MiB", "bold"
+        return f"{size_bytes / 1024 ** 2:>5.1f} MiB", "dim orange3"
     elif size_bytes < 1024 ** 4:
-        return f"{size_bytes / 1024 ** 3:>5.1f} GiB", "bold yellow"
+        return f"{size_bytes / 1024 ** 3:>5.1f} GiB", "bold orange1"
     else:
-        return f"{size_bytes / 1024 ** 4:>5.1f} TiB", "bold yellow"
+        return f"{size_bytes / 1024 ** 4:>5.1f} TiB", "bold orange1"
 
 
 def _fmt_mtime(ts: float) -> str:
