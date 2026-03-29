@@ -2,6 +2,10 @@
 
 A terminal UI for browsing and managing [snapper](http://snapper.io/) Btrfs snapshots.
 
+![Snapshots](screenshot-snapshots.png)
+![Size sorting](screenshot-size-sorting.png)
+![Browse markers](screenshot-markers.png)
+
 ## Requirements
 
 - Linux with Btrfs and snapper configured
