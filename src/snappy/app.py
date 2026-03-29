@@ -475,7 +475,7 @@ class BrowseScreen(ModalScreen):
                 key=lambda n: (not n.data.is_dir, n.data.name.lower())
                 if isinstance(n.data, backend.FileInfo) else (True, "")
             )
-        self.query_one("#browse-tree", Tree).refresh()
+        self.query_one("#browse-tree", Tree)._invalidate()
 
     def on_tree_node_expanded(self, event: Tree.NodeExpanded) -> None:
         node = event.node
