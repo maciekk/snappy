@@ -351,6 +351,8 @@ class BrowseScreen(ModalScreen):
         if level_map is None or dir_path_str not in level_map:
             return
         level_map[dir_path_str] = (node, size)
+        if self._sort_by_size:
+            self._sort_level(parent_path_str)
         self._redraw_level_bars(parent_path_str)
 
     def _redraw_all_levels(self) -> None:
@@ -467,8 +469,10 @@ class BrowseScreen(ModalScreen):
         level_map = self._level_sizes.get(path_str, {})
         if self._sort_by_size:
             parent_node._children.sort(
-                key=lambda n: -(level_map.get(getattr(n.data, "path", ""), (None, 0))[1]
-                                if isinstance(n.data, backend.FileInfo) else 0)
+                key=lambda n: (
+                    -level_map.get(n.data.path, (None, 0))[1]
+                    if isinstance(n.data, backend.FileInfo) else 0
+                )
             )
         else:
             parent_node._children.sort(
