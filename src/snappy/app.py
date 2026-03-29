@@ -793,7 +793,7 @@ class SnappyApp(App):
         # Build tabs — each starts with a spinner until its snapshots are loaded
         tabs = self.query_one("#config-tabs", TabbedContent)
         for cfg in configs:
-            pane_id = f"tab-{cfg.name}"
+            pane_id = cfg.name
             pane = TabPane(f"{cfg.name} ({cfg.subvolume})", id=pane_id)
             tabs.add_pane(pane)
             # Track the mapping from pane ID to config name
@@ -806,7 +806,7 @@ class SnappyApp(App):
         """Add a spinner to every tab pane, then kick off loading for the active tab."""
         for cfg in self.configs:
             try:
-                pane = self.query_one(f"#tab-{cfg.name}", TabPane)
+                pane = self.query_one(f"#{cfg.name}", TabPane)
                 pane.mount(BrailleSpinner("Loading snapshots…", id=f"spinner-{cfg.name}",
                                          classes="status-bar"))
             except Exception:
@@ -821,17 +821,22 @@ class SnappyApp(App):
         if not event.tab or not event.tab.id:
             return
 
-        # Try to find config using the pane mapping first
-        if event.tab.id in self._pane_to_config:
-            config_name = self._pane_to_config[event.tab.id]
-        else:
-            # Fallback: try to extract from tab ID (handles malformed IDs like "--content-tab-root")
-            config_name = event.tab.id
-            if "tab-" in config_name:
-                config_name = config_name.split("tab-", 1)[1]
-            # Remove any "--content" prefix that Textual might have added
-            if config_name.startswith("--content-"):
-                config_name = config_name[len("--content-"):]
+        # Try to find config using the pane mapping first (most reliable)
+        config_name = self._pane_to_config.get(event.tab.id)
+
+        if not config_name:
+            # Fallback: try to extract from tab ID (handles malformed IDs)
+            raw_id = event.tab.id
+            # Remove "--content-" prefix if present
+            if raw_id.startswith("--content-"):
+                raw_id = raw_id[len("--content-"):]
+            # Remove "tab-" prefix if present
+            if raw_id.startswith("tab-"):
+                config_name = raw_id[len("tab-"):]
+            else:
+                # Shouldn't happen, but use as-is if no known prefix
+                config_name = raw_id
+            log.warning("Tab ID '%s' not in pane mapping; extracted config_name='%s'", event.tab.id, config_name)
 
         if config_name and config_name not in self._loaded_configs:
             self._load_tab_snapshots(config_name)
@@ -841,31 +846,40 @@ class SnappyApp(App):
         log.info("Loading snapshots for config '%s'", config_name)
         snaps = []
         error_msg = None
-        try:
-            snaps = backend.get_snapshots(config_name)
-        except backend.SudoExpiredError:
-            log.warning("sudo expired while loading snapshots for '%s'", config_name)
-            self.app.call_from_thread(self._show_sudo_expired)
-            error_msg = "sudo credentials expired"
-        except Exception as e:
-            log.exception("Unexpected error loading snapshots for '%s'", config_name)
-            error_msg = f"Failed to load snapshots: {type(e).__name__}"
+
+        # Check if config_name is valid (not malformed like "tab-home")
+        if config_name.startswith("tab-") or config_name.startswith("--content-"):
+            error_msg = f"Invalid config name: '{config_name}' (likely a tab ID, not a config name)"
+            log.error(error_msg)
+        else:
+            # Check if this config is actually known
+            known_configs = {cfg.name for cfg in self.configs}
+            if config_name not in known_configs:
+                error_msg = f"Unknown config: '{config_name}'"
+                log.error(error_msg)
+            else:
+                try:
+                    snaps = backend.get_snapshots(config_name)
+                except backend.SudoExpiredError:
+                    log.warning("sudo expired while loading snapshots for '%s'", config_name)
+                    self.app.call_from_thread(self._show_sudo_expired)
+                    error_msg = "sudo credentials expired"
+                except Exception as e:
+                    log.exception("Unexpected error loading snapshots for '%s'", config_name)
+                    error_msg = f"Failed to load snapshots: {type(e).__name__}"
+
         self.app.call_from_thread(self._populate_tab, config_name, snaps, error_msg)
 
     def _populate_tab(self, config_name: str, snaps: list[backend.Snapshot], error_msg: str | None = None) -> None:
         self._loaded_configs.add(config_name)
 
         try:
-            pane = self.query_one(f"#tab-{config_name}", TabPane)
+            pane = self.query_one(f"#{config_name}", TabPane)
         except Exception:
             return
 
-        # Remove the placeholder spinner
-        for widget_id in (f"spinner-{config_name}",):
-            try:
-                pane.query_one(f"#{widget_id}").remove()
-            except Exception:
-                pass
+        # Clear all existing widgets from the pane (spinner, old tables, etc.)
+        pane.query("*").remove()
 
         # If there was an error loading snapshots, display the error message
         if error_msg:
@@ -873,10 +887,32 @@ class SnappyApp(App):
             pane.mount(error_widget)
             return
 
+        # Remove any existing table/status widgets by ID to avoid DuplicateIds errors
+        try:
+            pane.query_one(f"#table-{config_name}").remove()
+        except:
+            pass
+        try:
+            pane.query_one(f"#status-{config_name}").remove()
+        except:
+            pass
+
         table = DataTable(id=f"table-{config_name}")
         status = Static("", classes="status-bar", id=f"status-{config_name}")
-        pane.mount(table)
-        pane.mount(status)
+        try:
+            pane.mount(table)
+        except Exception as e:
+            log.warning("Failed to mount table for config '%s': %s (trying to remove and retry)", config_name, e)
+            try:
+                pane.query_one(f"#table-{config_name}").remove()
+                pane.mount(table)
+            except Exception as e2:
+                log.error("Could not mount table after retry: %s", e2)
+                return
+        try:
+            pane.mount(status)
+        except Exception as e:
+            log.warning("Failed to mount status widget for config '%s': %s", config_name, e)
 
         table.cursor_type = "row"
         col_keys = table.add_columns("#", "Type", "Date ↓", "Description", "Used Space", "Cleanup", "RO")
@@ -944,19 +980,23 @@ class SnappyApp(App):
         if not active_id:
             return self.configs[0] if self.configs else None
 
-        # Try to find config using the pane mapping first
-        if active_id in self._pane_to_config:
-            config_name = self._pane_to_config[active_id]
-        else:
-            # Fallback: try to extract from active_id (handles malformed IDs like "--content-tab-root")
-            # Remove any prefix patterns and extract just the config name
-            config_name = active_id
-            if "tab-" in config_name:
-                config_name = config_name.split("tab-", 1)[1]
-            # Remove any "--content" prefix that Textual might have added
-            if config_name.startswith("--content-"):
-                config_name = config_name[len("--content-"):]
+        # Try to find config using the pane mapping first (most reliable)
+        config_name = self._pane_to_config.get(active_id)
 
+        if not config_name:
+            # Fallback: try to extract from active_id (handles malformed IDs)
+            raw_id = active_id
+            # Remove "--content-" prefix if present
+            if raw_id.startswith("--content-"):
+                raw_id = raw_id[len("--content-"):]
+            # Remove "tab-" prefix if present
+            if raw_id.startswith("tab-"):
+                config_name = raw_id[len("tab-"):]
+            else:
+                # Shouldn't happen, but use as-is if no known prefix
+                config_name = raw_id
+
+        # Find the matching config
         for cfg in self.configs:
             if cfg.name == config_name:
                 return cfg
@@ -986,7 +1026,7 @@ class SnappyApp(App):
         # Rebuild each tab's placeholder spinner (drop existing table/status)
         for c in self.configs:
             try:
-                pane = self.query_one(f"#tab-{c.name}", TabPane)
+                pane = self.query_one(f"#{c.name}", TabPane)
                 pane.query("*").remove()
                 pane.mount(BrailleSpinner("Loading snapshots…", id=f"spinner-{c.name}",
                                          classes="status-bar"))
