@@ -100,6 +100,15 @@ class FileInSnapshot:
     exists: bool
 
 
+@dataclass
+class FileSearchMatch:
+    snapshot_number: int
+    snapshot_date: str
+    path: str
+    size: int
+    mtime: float
+
+
 def is_root() -> bool:
     return os.geteuid() == 0
 
@@ -507,6 +516,68 @@ def find_file_in_snapshots(
             ))
         except (PermissionError, OSError):
             pass
+
+    return results
+
+
+def search_files_in_snapshots(
+    config: SnapperConfig,
+    pattern: str,
+    snapshots: list[Snapshot],
+) -> list[FileSearchMatch]:
+    """Find files whose path contains *pattern* (substring) across all snapshots.
+
+    Uses a single privileged ``find`` invocation across the entire .snapshots
+    directory so we only pay the sudo overhead once.
+    """
+    snap_dir = Path(config.subvolume) / ".snapshots"
+    snap_by_number = {s.number: s for s in snapshots if s.number != 0}
+
+    result = _run_privileged([
+        "find", str(snap_dir),
+        "-path", f"*/snapshot/*{pattern}*",
+        "-printf", r"%s\t%T@\t%p\n",
+    ])
+
+    results: list[FileSearchMatch] = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        try:
+            size = int(parts[0])
+            mtime = float(parts[1])
+            abs_path = Path(parts[2])
+        except ValueError:
+            continue
+
+        try:
+            rel_to_snap_dir = abs_path.relative_to(snap_dir)
+        except ValueError:
+            continue
+
+        rel_parts = rel_to_snap_dir.parts
+        # Expected structure: {num}/snapshot/{rel/path}
+        if len(rel_parts) < 3 or rel_parts[1] != "snapshot":
+            continue
+
+        try:
+            snap_num = int(rel_parts[0])
+        except ValueError:
+            continue
+
+        snap = snap_by_number.get(snap_num)
+        if snap is None:
+            continue
+
+        rel_path = str(Path(*rel_parts[2:]))
+        results.append(FileSearchMatch(
+            snapshot_number=snap_num,
+            snapshot_date=snap.date,
+            path=rel_path,
+            size=size,
+            mtime=mtime,
+        ))
 
     return results
 

@@ -164,30 +164,31 @@ class FileSearchScreen(ModalScreen):
         with Vertical(id="search-dialog"):
             yield Label(f"File Search — config: [bold]{self.config.name}[/bold] ({self.config.subvolume})")
             yield Label(
-                f"Enter path relative to {self.config.subvolume} (e.g. home/user/bigfile.tar)",
+                "Enter a substring to search for across all snapshots (matches any part of the path)."
+                " Glob wildcards supported: * matches anything, ? matches one character.",
                 id="search-hint",
             )
-            yield Input(placeholder="relative/path/to/file", id="search-input")
+            yield Input(placeholder="search term (e.g. fstab, home/user, .conf)", id="search-input")
             yield BrailleSpinner(id="search-loading")
             yield DataTable(id="search-results")
 
     def on_mount(self) -> None:
         table = self.query_one("#search-results", DataTable)
-        table.add_columns("Snapshot #", "Date", "Exists", "Size", "Modified")
+        table.add_columns("Snapshot #", "Date", "Path", "Size", "Modified")
         self.query_one("#search-input", Input).focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        relative_path = event.value.strip()
-        if not relative_path:
+        pattern = event.value.strip()
+        if not pattern:
             return
         self.query_one("#search-loading", BrailleSpinner).styles.display = "block"
-        self._do_search(relative_path)
+        self._do_search(pattern)
 
     @work(thread=True)
-    def _do_search(self, relative_path: str) -> None:
+    def _do_search(self, pattern: str) -> None:
         try:
             snapshots = backend.get_snapshots(self.config.name)  # cache hit
-            results = backend.find_file_in_snapshots(self.config, relative_path, snapshots)
+            results = backend.search_files_in_snapshots(self.config, pattern, snapshots)
         except backend.SudoExpiredError:
             self.app.call_from_thread(self._on_sudo_expired_search)
             return
@@ -197,16 +198,18 @@ class FileSearchScreen(ModalScreen):
         self.query_one("#search-loading", BrailleSpinner).styles.display = "none"
         self.app.push_screen(SudoExpiredScreen())
 
-    def _populate_results(self, results: list[backend.FileInSnapshot]) -> None:
+    def _populate_results(self, results: list[backend.FileSearchMatch]) -> None:
         self.query_one("#search-loading", BrailleSpinner).styles.display = "none"
         table = self.query_one("#search-results", DataTable)
         table.clear()
         for r in results:
-            snap_label = "(live)" if r.snapshot_number == -1 else str(r.snapshot_number)
-            exists_str = "Yes" if r.exists else "No"
-            size_str = _fmt_size(r.size) if r.exists else "-"
-            mtime_str = _fmt_mtime(r.mtime) if r.exists else "-"
-            table.add_row(snap_label, r.snapshot_date, exists_str, size_str, mtime_str)
+            table.add_row(
+                str(r.snapshot_number),
+                r.snapshot_date,
+                r.path,
+                _fmt_size(r.size),
+                _fmt_mtime(r.mtime),
+            )
 
 
 # ── Browse Snapshot Screen ───────────────────────────────────────────────
