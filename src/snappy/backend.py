@@ -27,6 +27,7 @@ _snapshot_cache: dict[str, list] = {}          # config_name -> list[Snapshot]
 _config_detail_cache: dict[str, dict] = {}     # config_name -> dict[str, str]
 _dir_size_cache: dict[str, int] = {}           # abs path -> total bytes (from du -sb)
 _status_cache: dict[tuple, dict[str, str]] = {}  # (config_name, snap_num) -> {rel_path -> status_char}
+_exclusive_cache: dict[tuple, list] = {}  # (config_name, snap_num, next_num) -> list[ExclusiveFile]
 
 
 def invalidate_cache(config_name: str | None = None) -> None:
@@ -36,6 +37,7 @@ def invalidate_cache(config_name: str | None = None) -> None:
         _config_detail_cache.clear()
         _dir_size_cache.clear()
         _status_cache.clear()
+        _exclusive_cache.clear()
         log.debug("Cache invalidated (all configs)")
     else:
         _snapshot_cache.pop(config_name, None)
@@ -108,6 +110,13 @@ class FileSearchMatch:
     path: str
     size: int
     mtime: float
+
+
+@dataclass
+class ExclusiveFile:
+    """A file that exists in one snapshot but not the next."""
+    path: str
+    size: int
 
 
 def is_root() -> bool:
@@ -605,6 +614,86 @@ def search_files_in_snapshots(
         ))
 
     return results
+
+
+def get_snapshot_exclusive_files(
+    config: SnapperConfig,
+    config_name: str,
+    snap_num: int,
+    next_snap_num: int,
+) -> list[ExclusiveFile]:
+    """Find files exclusive to *snap_num* (deleted by *next_snap_num*), sorted by size desc.
+
+    Runs ``snapper status snap_num..next_snap_num`` and collects paths whose
+    first status character is ``-`` (exist in the older snapshot but not the
+    newer one).  Each path is then stat'd inside the older snapshot's tree to
+    obtain its size.
+
+    Use *next_snap_num* = 0 to compare against the live filesystem.
+    Results are cached (both snapshots are immutable).
+    """
+    key = (config_name, snap_num, next_snap_num)
+    if key in _exclusive_cache:
+        log.debug("Cache hit: exclusive files for %s #%d..#%d", config_name, snap_num, next_snap_num)
+        return _exclusive_cache[key]
+
+    result = _run_privileged([
+        "snapper", "-c", config_name, "status", f"{snap_num}..{next_snap_num}",
+    ], timeout=600)
+    if result.returncode != 0:
+        log.error("snapper status %d..%d failed for config '%s'", snap_num, next_snap_num, config_name)
+        return []
+
+    # Collect paths of deleted files (exist in snap_num but not next_snap_num)
+    deleted_paths: list[str] = []
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0][0] == "-":
+            deleted_paths.append(parts[1])
+
+    if not deleted_paths:
+        _exclusive_cache[key] = []
+        return []
+
+    # Resolve to absolute paths within the snapshot tree
+    snap_path = get_snapshot_path(config, snap_num)
+    subvol = Path(config.subvolume)
+    # Map: absolute snapshot path -> original snapper path
+    path_map: dict[str, str] = {}
+    for p in deleted_paths:
+        try:
+            rel = Path(p).relative_to(subvol)
+        except ValueError:
+            rel = Path(p.lstrip("/"))
+        path_map[str(snap_path / rel)] = p
+
+    # Batch stat for sizes (groups of 5000 to stay within ARG_MAX)
+    files: list[ExclusiveFile] = []
+    abs_paths = list(path_map.keys())
+    BATCH = 5000
+    for i in range(0, len(abs_paths), BATCH):
+        batch = abs_paths[i:i + BATCH]
+        stat_result = _run_privileged(
+            ["stat", "--printf", r"%s\t%n\n"] + batch,
+            timeout=300,
+        )
+        for line in stat_result.stdout.splitlines():
+            tab_idx = line.find("\t")
+            if tab_idx < 0:
+                continue
+            try:
+                size = int(line[:tab_idx])
+            except ValueError:
+                continue
+            abs_p = line[tab_idx + 1:]
+            rel_p = path_map.get(abs_p)
+            if rel_p is not None:
+                files.append(ExclusiveFile(path=rel_p, size=size))
+
+    files.sort(key=lambda f: f.size, reverse=True)
+    _exclusive_cache[key] = files
+    log.info("Exclusive files for %s #%d..#%d: %d files", config_name, snap_num, next_snap_num, len(files))
+    return files
 
 
 def delete_snapshot(config_name: str, snapshot_number: int) -> tuple[bool, str]:

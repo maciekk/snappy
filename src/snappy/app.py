@@ -213,6 +213,105 @@ class FileSearchScreen(ModalScreen):
             )
 
 
+# ── Snapshot Cost Screen ─────────────────────────────────────────────────
+
+class SnapshotCostScreen(ModalScreen):
+    """Show files exclusive to a snapshot — its incremental disk cost."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Back"),
+    ]
+
+    CSS = """
+    SnapshotCostScreen {
+        align: center middle;
+    }
+    #cost-dialog {
+        width: 90%;
+        height: 85%;
+        border: thick $secondary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #cost-hint {
+        color: $text-disabled;
+        margin-bottom: 1;
+        height: auto;
+    }
+    #cost-results {
+        height: 1fr;
+    }
+    #cost-loading {
+        height: 1;
+        display: none;
+    }
+    #cost-summary {
+        height: auto;
+        padding-top: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        config: backend.SnapperConfig,
+        snap_num: int,
+        next_snap_num: int,
+        snap_date: str,
+        next_label: str,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.snap_num = snap_num
+        self.next_snap_num = next_snap_num
+        self.snap_date = snap_date
+        self.next_label = next_label
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="cost-dialog"):
+            yield Label(
+                f"Exclusive files in snapshot [bold]#{self.snap_num}[/bold] vs {self.next_label}"
+            )
+            yield Label(
+                f"Files present in #{self.snap_num} ({self.snap_date}) but absent from {self.next_label}.",
+                id="cost-hint",
+            )
+            yield BrailleSpinner("Comparing snapshots…", id="cost-loading")
+            yield DataTable(id="cost-results")
+            yield Static("", id="cost-summary")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#cost-results", DataTable)
+        table.add_columns("Size", "Path")
+        self.query_one("#cost-loading", BrailleSpinner).styles.display = "block"
+        self._compute()
+
+    @work(thread=True)
+    def _compute(self) -> None:
+        try:
+            files = backend.get_snapshot_exclusive_files(
+                self.config, self.config.name, self.snap_num, self.next_snap_num,
+            )
+        except backend.SudoExpiredError:
+            self.app.call_from_thread(self._on_sudo_expired)
+            return
+        self.app.call_from_thread(self._populate, files)
+
+    def _on_sudo_expired(self) -> None:
+        self.query_one("#cost-loading", BrailleSpinner).styles.display = "none"
+        self.app.push_screen(SudoExpiredScreen())
+
+    def _populate(self, files: list[backend.ExclusiveFile]) -> None:
+        self.query_one("#cost-loading", BrailleSpinner).styles.display = "none"
+        table = self.query_one("#cost-results", DataTable)
+        table.clear()
+        for f in files:
+            table.add_row(_fmt_size(f.size), f.path)
+        total = sum(f.size for f in files)
+        self.query_one("#cost-summary", Static).update(
+            f"{len(files)} exclusive files — total: [bold]{_fmt_size(total)}[/bold]"
+        )
+
+
 # ── Browse Snapshot Screen ───────────────────────────────────────────────
 
 class BrowseScreen(ModalScreen):
@@ -736,6 +835,7 @@ class SnappyApp(App):
         Binding("f", "file_search", "File Search"),
         Binding("b,enter", "browse", "Browse Snapshot"),
         Binding("d", "delete_snapshot", "Delete Snapshot"),
+        Binding("e", "snapshot_cost", "Exclusive Size"),
     ]
 
     def __init__(self) -> None:
@@ -885,6 +985,9 @@ class SnappyApp(App):
 
     @work(thread=True)
     def _load_tab_snapshots(self, config_name: str) -> None:
+        if config_name in self._loaded_configs:
+            log.debug("Skipping duplicate load for already-loaded config '%s'", config_name)
+            return
         log.info("Loading snapshots for config '%s'", config_name)
         snaps = []
         error_msg = None
@@ -1045,14 +1148,21 @@ class SnappyApp(App):
         return self.configs[0] if self.configs else None
 
     def _get_selected_snapshot_number(self) -> int | None:
-        cfg = self._get_active_config()
-        if not cfg:
-            return None
-        try:
-            table = self.query_one(f"#table-{cfg.name}", DataTable)
-        except Exception:
-            return None
-        if table.cursor_row is not None and table.row_count > 0:
+        table: DataTable | None = None
+        # Prefer the focused DataTable (avoids issues with duplicate widget IDs)
+        focused = self.screen.focused
+        if isinstance(focused, DataTable) and focused.id and focused.id.startswith("table-"):
+            table = focused
+        else:
+            # Fallback: query by active config name
+            cfg = self._get_active_config()
+            if not cfg:
+                return None
+            try:
+                table = self.query_one(f"#table-{cfg.name}", DataTable)
+            except Exception:
+                return None
+        if table is not None and table.row_count > 0:
             row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
             return int(row_key.value)
         return None
@@ -1134,6 +1244,32 @@ class SnappyApp(App):
                 ConfirmDeleteScreen(cfg.name, snap_num),
                 callback=self._handle_delete,
             )
+
+    def action_snapshot_cost(self) -> None:
+        cfg = self._get_active_config()
+        snap_num = self._get_selected_snapshot_number()
+        if not cfg or not snap_num:
+            return
+        snaps = backend.get_snapshots(cfg.name)
+        sorted_snaps = sorted(
+            [s for s in snaps if s.number > 0], key=lambda s: s.number,
+        )
+        current_idx = next(
+            (i for i, s in enumerate(sorted_snaps) if s.number == snap_num), None,
+        )
+        if current_idx is None:
+            return
+        current_snap = sorted_snaps[current_idx]
+        if current_idx + 1 < len(sorted_snaps):
+            next_snap = sorted_snaps[current_idx + 1]
+            next_num = next_snap.number
+            next_label = f"#{next_snap.number} ({next_snap.date})"
+        else:
+            next_num = 0
+            next_label = "current filesystem"
+        self.push_screen(SnapshotCostScreen(
+            cfg, snap_num, next_num, current_snap.date, next_label,
+        ))
 
     def _handle_delete(self, confirmed: bool | None) -> None:
         if not confirmed:
