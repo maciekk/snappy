@@ -220,6 +220,7 @@ class SnapshotCostScreen(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "dismiss", "Back"),
+        Binding("s", "toggle_sort", "Sort"),
     ]
 
     CSS = """
@@ -265,6 +266,8 @@ class SnapshotCostScreen(ModalScreen):
         self.next_snap_num = next_snap_num
         self.snap_date = snap_date
         self.next_label = next_label
+        self._files: list[backend.ExclusiveFile] = []
+        self._sort_by_size: bool = True
 
     def compose(self) -> ComposeResult:
         with Vertical(id="cost-dialog"):
@@ -302,14 +305,51 @@ class SnapshotCostScreen(ModalScreen):
 
     def _populate(self, files: list[backend.ExclusiveFile]) -> None:
         self.query_one("#cost-loading", BrailleSpinner).styles.display = "none"
+        self._files = files
+        self._refresh_table()
+
+    def _refresh_table(self) -> None:
         table = self.query_one("#cost-results", DataTable)
         table.clear()
-        for f in files:
-            table.add_row(_fmt_size(f.size), f.path)
-        total = sum(f.size for f in files)
+        total = sum(f.size for f in self._files)
+        if self._sort_by_size:
+            sorted_files = sorted(self._files, key=lambda f: -f.size)
+            for f in sorted_files:
+                table.add_row(_fmt_size(f.size), f.path)
+            sort_label = "by size"
+        else:
+            # Group files by immediate parent directory.
+            from collections import defaultdict
+            dir_files: dict[str, list[backend.ExclusiveFile]] = defaultdict(list)
+            for f in self._files:
+                dir_files[str(Path(f.path).parent)].append(f)
+            # Compute recursive directory subtotals (each ancestor gets the sum).
+            dir_sizes: dict[str, int] = defaultdict(int)
+            for f in self._files:
+                p = Path(f.path).parent
+                while str(p) != p.root and str(p) != ".":
+                    dir_sizes[str(p)] += f.size
+                    p = p.parent
+            # Show all directories with subtotals (parents before children).
+            for dir_path in sorted(dir_sizes):
+                table.add_row(
+                    Text(f"[{_fmt_size(dir_sizes[dir_path])}]", style="bold cyan"),
+                    Text(f"{dir_path}/", style="bold cyan"),
+                )
+                direct = dir_files.get(dir_path, [])
+                if len(direct) > 1 and dir_sizes[dir_path] >= 1024 * 1024:
+                    for f in sorted(direct, key=lambda f: f.path):
+                        table.add_row(_fmt_size(f.size), f"  {Path(f.path).name}")
+            sort_label = "by path"
         self.query_one("#cost-summary", Static).update(
-            f"{len(files)} exclusive files — total: [bold]{_fmt_size(total)}[/bold]"
+            f"{len(self._files)} exclusive files — total: [bold]{_fmt_size(total)}[/bold]  (sorted {sort_label}, [bold]s[/bold] to toggle)"
         )
+
+    def action_toggle_sort(self) -> None:
+        if not self._files:
+            return
+        self._sort_by_size = not self._sort_by_size
+        self._refresh_table()
 
 
 # ── Browse Snapshot Screen ───────────────────────────────────────────────
